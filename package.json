@@ -1,0 +1,55 @@
+{
+  "name": "@reqall/pi-plugin",
+  "version": "2026.5.6",
+  "description": "Reqall plugin for Pi — persistent semantic memory for AI agents",
+  "type": "module",
+  "bin": {
+    "reqall-pi-plugin": "bin/reqall-pi-plugin.mjs"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "npm run typecheck && node bin/reqall-pi-plugin.mjs --json && npm pack --dry-run",
+    "clean": "rm -rf node_modules *.tgz"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "reqall",
+    "memory",
+    "semantic-memory",
+    "rag",
+    "agent-skills",
+    "project-context"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/reqall.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-ai": "^0.73.0",
+    "@mariozechner/pi-coding-agent": "^0.73.0",
+    "@types/node": "^24.3.0",
+    "typebox": "^1.1.24",
+    "typescript": "^5.7.3"
+  },
+  "files": [
+    "bin",
+    "extensions",
+    "skills",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20.6.0"
+  },
+  "license": "MIT"
+}
