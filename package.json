@@ -9,6 +9,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "npm run typecheck && node bin/reqall-pi-plugin.mjs --json && npm pack --dry-run",
+    "verify:mcp": "node scripts/verify-mcp-base.mjs",
     "clean": "rm -rf node_modules *.tgz"
   },
   "keywords": [
@@ -44,6 +45,7 @@
   "files": [
     "bin",
     "extensions",
+    "scripts",
     "skills",
     "README.md",
     "LICENSE"

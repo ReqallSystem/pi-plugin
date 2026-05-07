@@ -118,6 +118,14 @@ npm test
 
 `npm test` typechecks the extension, verifies the CLI manifest output, and runs `npm pack --dry-run`.
 
+To verify the deployed Reqall MCP base surface from `https://www.reqall.net/docs/mcp.md`, set `REQALL_API_KEY` and run:
+
+```bash
+npm run verify:mcp
+```
+
+This live smoke test checks `HEAD /mcp`, confirms the documented tool list, creates two temporary records, searches/lists/reads them, links them, traverses impact, then deletes the temporary link and records.
+
 ## License
 
 MIT
