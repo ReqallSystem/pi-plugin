@@ -3,6 +3,9 @@
   "version": "2026.5.6",
   "description": "Reqall plugin for Pi — persistent semantic memory for AI agents",
   "type": "module",
+  "publishConfig": {
+    "access": "public"
+  },
   "bin": {
     "reqall-pi-plugin": "bin/reqall-pi-plugin.mjs"
   },
