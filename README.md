@@ -21,6 +21,12 @@ pi install ./pi-plugin
 pi -e ./pi-plugin
 ```
 
+From GitHub:
+
+```bash
+pi install git:github.com/ReqallSystem/pi-plugin
+```
+
 When published:
 
 ```bash
@@ -56,18 +62,22 @@ Pi does not currently include built-in MCP client configuration, so the extensio
 - `reqall_delete_link` (explicit user request only)
 - `reqall_sleep_candidates`
 - `reqall_sleep_apply`
+- `reqall_merge_projects` — irreversible; explicit confirmation required
+- `reqall_capabilities` — discover supported fields/kinds, or a full schema with `tool_name`
 
 ### Automation
 
 | Pi event | Behavior |
 |---|---|
-| `session_start` | Shows Reqall status in the footer |
+| `session_start` | Restores applied selection from active-branch custom entries (new sessions reset) and shows Reqall footer status |
+| `input` | Stages labelled user selections for the next context boundary; ignores extension messages and skill-operation arguments |
 | `before_agent_start` | Detects project, injects system prompt guidance, and (by default) fetches context via Reqall |
 | `agent_end` | Reminds about persistence for non-trivial turns; can optionally queue a follow-up persistence turn |
 
 ### Commands
 
 - `/reqall-context [query]` — fetch context and trigger a model turn with it
+- `/reqall-intend [scope]` — record agreed behavior/architecture before work
 - `/reqall-persist [summary]` — ask the agent to classify and persist completed work
 - `/reqall-review [filter]` — review open records
 - `/reqall-triage [description]` — triage a new issue/request
@@ -78,11 +88,128 @@ Pi does not currently include built-in MCP client configuration, so the extensio
 Skills are bundled under Pi-compatible names:
 
 - `/skill:reqall-context`
+- `/skill:reqall-intend`
 - `/skill:reqall-persist`
 - `/skill:reqall-document`
 - `/skill:reqall-triage`
 - `/skill:reqall-review`
 - `/skill:reqall-sleep`
+
+## Originating sessions and server capabilities
+
+Each invocation uses `pi:` plus a SHA-256 digest of Pi's session UUID. It contains
+no raw session paths, names or credentials. The label remains stable across
+reload, resume, compaction, tree navigation and project switches; new/forked Pi
+sessions have new UUIDs and therefore new labels. Async invocation-local storage
+keeps concurrent calls isolated.
+
+Paginated `tools/list` discovery is cached for 60 seconds per extension and
+endpoint/credential identity. Discovery has its own 15-second deadline; cancelling
+one caller stops only that caller's wait, not another invocation's discovery or
+attribution. Every exposed write (including project resolution,
+inline links, deletion, SLEEP and project merge) receives `session_id` only when
+its own schema advertises the string field. Supplied labels are replaced, never
+trusted. Legacy/discovery-unavailable servers continue without attribution;
+failed discovery is retried on the next call. Cancellation propagates, individual
+HTTP requests have a 15-second deadline, and redirects are refused.
+
+Use `reqall_capabilities` before `work`/`info` kinds, inline `links`, `project_only`
+or merge. Unadvertised additive arguments fail locally rather than silently
+losing links or changing record kinds. Legacy outcomes use `todo` and separate
+`reqall_upsert_link` calls. Pass `tool_name: "sleep_apply"` for operation schemas.
+Tools preserve structured results, including per-link partial failures. Visible
+output is bounded to 12,000 characters; truncated results are saved in a private
+temporary directory (file mode 0600) with a path for full readback. Each extension
+instance removes its files at session shutdown (including reload/session switches)
+or normal process exit; fetch again after resuming instead of relying on old
+paths. Cleanup is best-effort and cannot run after SIGKILL or a machine failure.
+Narrow queries or paginate when possible.
+
+The workflow is context → agreed intent → work → persist/reconcile → readback.
+`reqall-intend` reuses or creates one spec/arch for agreed non-trivial changes.
+Outcomes implement intent, tests test it, and open gap todos block it. Read back
+saved records and all relevant link pages before the final project list; repair
+partial saves using existing IDs, never duplicate creates.
+
+**Limits:** these are advisory workflows, not enforced persistence guardrails.
+This release does not automatically subscribe/poll or implement Reqall OAuth.
+The tested event-filter predicate suppresses only `actor=self` with an exact,
+non-null matching session label; no account/record-ID heuristic is safe. Session
+labels are untrusted correlation metadata, never authorization or cursors.
+Server migration/deployment and event fan-out acceptance remain server concerns.
+See [PARITY.md](PARITY.md) for the comparison and remaining work.
+
+## Project binding (portable policy)
+
+Use the exact effective project supplied by the Pi extension throughout recall,
+work, persistence, and verification; do not independently rediscover a different
+name. Deliberate operation arguments (including a SLEEP project ID/name or
+`reqall_project_context.project_name`) affect only that operation. `.user` is an
+intentional account-wide preferences target, not an automatic fallback.
+
+Pi freezes the effective binding for each context-bound run. Labelled ordinary
+user input becomes a pending selection and takes effect at the next non-generated
+`before_agent_start`, never during active tools or their persistence followup.
+Streaming followups/steering consumed inside the existing agent loop keep its
+binding until that next context boundary. The latest pending label wins.
+Applied selections are stored in Pi custom session entries and restored from the
+active branch on startup/resume/reload/fork; a new session starts without one.
+Unapplied pending input is not persisted. Arguments to any bundled
+`/skill:reqall-*` invocation (for example `/skill:reqall-sleep project_name=.user`)
+are operation-specific and never select the session project. Supply a label in
+ordinary user input to change the session selection instead.
+
+Without a supplied binding, use this ordered chain:
+1. Nonempty trimmed `REQALL_PROJECT_NAME` (environment wins; Pi adds no project settings).
+2. Actual network Git `origin`: HTTP(S), SSH, Git or SCP-style. Remove trailing
+   slashes and terminal `.git`; retain the final two path segments, including for
+   nested namespaces. Local paths and `file:` remotes fall through.
+3. Explicit user `project_name` or `project` label using `:` or `=`, with unquoted,
+   single-, double-, or backtick-quoted value, or the retained session selection.
+   Strip sentence punctuation only from unquoted values. Never infer from arbitrary
+   slash tokens, URLs, incidental paths, or synthetic reports/quoted examples.
+4. Nearest valid ancestor `.reqall.yml`, then `.reqall.yaml` identity.
+5. Nearest valid package identity: `package.json`, `go.mod`, then `Cargo.toml`
+   at each directory before searching its parent.
+6. Exact POSIX-style cwd-relative path within a known workspace root.
+7. `.machine/<short-lower-hostname>/<os-user>` (OS account, not `USER`/`USERNAME`).
+   `REQALL_MACHINE_NAME` replaces the whole host segment, sanitized/lowercased
+   while retaining deliberate dots. Never use an unconstrained cwd basename.
+
+Explicit manual names preserve historical identifiers apart from outer whitespace;
+never migrate records during discovery. Automatic metadata uses ASCII letters,
+digits, `_`, `-`, `.` in slash-separated segments. Reject absolute POSIX, drive,
+UNC, backslash, tilde, empty, `.` and `..` segments before normalization; do not
+strip leading separators. Intentional `src` and `work` names are valid.
+
+Read only regular UTF-8 metadata files up to 64 KiB; skip unreadable, oversized,
+malformed, unsupported, and non-string values. YAML supports top-level string
+`project` (preferred) or `name`, matching single/double quotes and trailing
+comments; reject ambiguous duplicate keys, malformed quotes, plain boolean/null/
+numeric values, nested mappings, aliases and multiline scalars. `package.json`
+requires a string `name`; remove one leading `@` only for a valid npm scoped name.
+`go.mod` preserves the full declared module including domain/nested path/version;
+leading comments and empty files are safe. Cargo reads a simple quoted `name`
+inside `[package]`, not `[[bin]]` or dependencies; this is not full TOML parsing.
+
+Search nearest valid ancestors up to the containing workspace root inclusive, or
+filesystem root if none is known. `REQALL_WORKSPACE_ROOT` comes from process env
+(relative to cwd; `~/` expands home), otherwise use the nearest regular ancestor
+`.reqall-workspace` marker. Resolve real paths before containment checks so symlinks
+cannot escape. An invalid/non-containing explicit root must not silently use a
+marker. Cwd equal to root has no relative identity. Preserve every relative
+segment, including `src`/`work`; a rootless plain directory uses machine memory.
+
+Pi captures labelled selections from the documented `input` event (`interactive`
+or `rpc` sources), excluding extension-generated messages and all seven bundled
+skill invocations. `before_agent_start` applies pending selections and resolves the
+binding once; it never parses expanded skill text or generated persistence prompts.
+Environment and network Git remain higher priority at that boundary. Default
+context/search tools, workflow prompts and automatic persistence reuse the frozen
+binding. Explicit tool names/IDs remain one-shot overrides. Selection storage uses
+`pi.appendEntry("reqall-project-selection", { projectName })` and restoration uses
+`ctx.sessionManager.getBranch()`, so unrelated branches do not leak selections.
+Sessions predating these custom entries have no stored selection to restore.
 
 ## Environment Variables
 
@@ -91,7 +218,9 @@ Skills are bundled under Pi-compatible names:
 | `REQALL_API_KEY` | required | Reqall API key (`rq_...`) |
 | `REQALL_URL` | `https://www.reqall.net` | Reqall server base URL |
 | `REQALL_API_URL` | unset | Fallback base URL if `REQALL_URL` is not set |
-| `REQALL_PROJECT_NAME` | auto | Override project name |
+| `REQALL_PROJECT_NAME` | auto | Highest-priority nonempty trimmed project name |
+| `REQALL_WORKSPACE_ROOT` | unset | Explicit workspace boundary and relative-path fallback root |
+| `REQALL_MACHINE_NAME` | OS hostname | Override the entire machine hostname segment |
 | `REQALL_CONTEXT_LIMIT` | `5` | Semantic search result count for context injection |
 | `REQALL_OPEN_LIMIT` | `25` | Open-record count for context injection |
 | `REQALL_AUTO_CONTEXT` | `inject` | `inject`, `reminder`, or `off` |
@@ -116,7 +245,7 @@ npm install
 npm test
 ```
 
-`npm test` typechecks the extension, verifies the CLI manifest output, and runs `npm pack --dry-run`.
+`npm test` typechecks the extension, executes routing and attribution tests against source and an extracted npm tarball, verifies the CLI manifest output, and runs `npm pack --dry-run`. Tests transpile TypeScript using the dev dependency (no Node TypeScript-stripping requirement or added runtime dependency). HTTP is stubbed with an asserted fixture-only URL; no production MCP calls or profile installs occur. The lifecycle suite executes handlers loaded by the real Pi TypeScript loader against source and the extracted tarball, replays the installed host input-before-queue path, expands real bundled skills, and uses Pi SessionManager custom entries. Streaming isolation, reload/resume/fork restoration, new-session reset, retained/user-changed selections, env/Git precedence, default search/context, persistence/review/triage, and one-shot skill/tool/native SLEEP overrides are exercised.
 
 To verify the deployed Reqall MCP base surface from `https://www.reqall.net/docs/mcp.md`, set `REQALL_API_KEY` and run:
 
