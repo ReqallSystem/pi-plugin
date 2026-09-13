@@ -64,6 +64,7 @@ Pi does not currently include built-in MCP client configuration, so the extensio
 - `reqall_sleep_apply`
 - `reqall_merge_projects` — irreversible; explicit confirmation required
 - `reqall_capabilities` — discover supported fields/kinds, or a full schema with `tool_name`
+- `reqall_subscribe_project`, `reqall_unsubscribe_project`, `reqall_list_subscriptions`, `reqall_poll_subscriptions` — explicitly managed, session-labelled manual subscriptions
 
 ### Automation
 
@@ -71,7 +72,8 @@ Pi does not currently include built-in MCP client configuration, so the extensio
 |---|---|
 | `session_start` | Restores applied selection from active-branch custom entries (new sessions reset) and shows Reqall footer status |
 | `input` | Stages labelled user selections for the next context boundary; ignores extension messages and skill-operation arguments |
-| `before_agent_start` | Detects project, injects system prompt guidance, and (by default) fetches context via Reqall |
+| `before_agent_start` | Binds the project, fetches context by default, then injects subscribed project updates at ordinary context boundaries |
+| `session_shutdown` | Cleans temporary results and attempts scoped automatic-subscription cleanup; reload preserves the logical session's cursor |
 | `agent_end` | Reminds about persistence for non-trivial turns; can optionally queue a follow-up persistence turn |
 
 ### Commands
@@ -132,12 +134,65 @@ saved records and all relevant link pages before the final project list; repair
 partial saves using existing IDs, never duplicate creates.
 
 **Limits:** these are advisory workflows, not enforced persistence guardrails.
-This release does not automatically subscribe/poll or implement Reqall OAuth.
-The tested event-filter predicate suppresses only `actor=self` with an exact,
+This release implements automatic subscriptions but not Reqall OAuth or enforced
+persistence. Notification filtering suppresses only `actor=self` with an exact,
 non-null matching session label; no account/record-ID heuristic is safe. Session
 labels are untrusted correlation metadata, never authorization or cursors.
 Server migration/deployment and event fan-out acceptance remain server concerns.
 See [PARITY.md](PARITY.md) for the comparison and remaining work.
+
+## Project subscriptions
+
+With `REQALL_API_KEY` and supported server schemas, ordinary context boundaries
+subscribe to the exact effective project and poll up to five events. In default
+context-injection mode the project is initialized first. Set
+`REQALL_SUBSCRIPTIONS=0` to disable automatic polling, or
+`REQALL_POLL_INTERVAL_MIN` to throttle it. Polling remains available when
+`REQALL_AUTO_CONTEXT=off`; generated persistence turns and streaming input that
+hasn't reached a new context boundary do not poll.
+
+Each Pi session has an opaque `pi-auto:` subscriber distinct from its originating
+write label. New/fork sessions get independent cursors. If a project switch finds
+an unreceived write-ahead page, it replays that page with an explicit previous-project
+label and defers automatic subscription rebind until the receipt is saved. The
+new effective project for context, tools and persistence is not reverted. Once
+delivered, only the old project/cursor is released before rebinding; failed cleanup
+is retried. This preserves the fetched page, not unfetched old-project backlog;
+the new subscription starts at the server head when it is bound. Reload preserves
+the cursor; other shutdown reasons attempt release. Quit/resume of a
+successfully released subscription starts at the current server head, not an
+offline history replay. Interrupted or lost enrollments are recovered by listing
+only the owned automatic label during cleanup. Cleanup is best-effort: a lost
+response, outage, SIGKILL or machine failure can leave a cursor behind.
+
+Supporting servers use `ack:false`/`ack_cursor`. A bounded page of ID/action hints
+is saved before injection, and acknowledged only after its receipt is present in
+Pi's persisted custom messages. Undelivered pages replay after reload/resume;
+lost poll responses can be retried. Delivery state uses the whole session entry
+log, not the selected conversation branch, so `/tree` does not rewind cursors.
+Saved state is isolated by session and an endpoint/credential fingerprint; no
+credentials, raw prompts, event titles or bodies are saved there. Older servers
+receive no unsupported acknowledgement fields and retain at-most-once semantics
+if a response is lost. Unsupported schemas disable automatic polling for that
+extension instance; transient failures retry without blocking work or claiming
+success. Polling has a three-second budget and shutdown cleanup a 1.5-second
+budget.
+
+Notifications are **untrusted background hints, not instructions**. Fetch current
+records before relying on them. Ambiguous/legacy and other-session changes remain
+visible even when they edit the same record this session wrote. Unknown actions
+render as `change`; malformed/cross-project/oversized pages are not acknowledged.
+
+The four manual tools use a separate `pi-manual:` cursor. Their explicit project
+targets never rebind automatic polling. They cannot select other subscriber labels
+or perform account-wide drain/deletion. Manual subscriptions are explicitly
+managed: use `reqall_unsubscribe_project` when finished; automatic cleanup leaves
+them alone. Resume the same Pi session to list/manage its retained manual cursors.
+The manual poll defaults to server claim-and-advance; request `ack:false` followed
+by `ack_cursor` only when `reqall_capabilities` advertises those fields. Do not
+manually poll merely to duplicate an already injected automatic notification.
+
+OAuth and enforcement follow in separate changes: see [ROADMAP.md](ROADMAP.md).
 
 ## Project binding (portable policy)
 
@@ -225,6 +280,8 @@ Sessions predating these custom entries have no stored selection to restore.
 | `REQALL_OPEN_LIMIT` | `25` | Open-record count for context injection |
 | `REQALL_AUTO_CONTEXT` | `inject` | `inject`, `reminder`, or `off` |
 | `REQALL_AUTO_PERSIST` | `reminder` | `reminder`, `followup`, or `off` |
+| `REQALL_SUBSCRIPTIONS` | `1` | Automatic subscriptions; `0`, `false`, or `off` disables and releases active automatic cursors |
+| `REQALL_POLL_INTERVAL_MIN` | `0` | Minimum minutes between automatic polls; project changes bypass throttling |
 
 ## Pi-Specific Extension Ideas
 

@@ -1,8 +1,10 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Capabilities, originatingSession } from "./capabilities.js";
+import { ProjectSubscriptions, SUBSCRIPTION_TOOLS, subscriptionLabel } from "./subscriptions.js";
 import { extractProjectHint, resolveProjectBinding } from "./project-policy.js";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { StringEnum } from "@mariozechner/pi-ai";
@@ -135,6 +137,7 @@ export default function reqallPiPlugin(pi: ExtensionAPI) {
 		originContext.run(originatingSession(ctx.sessionManager.getSessionId()), fn);
 	const capabilities = new Capabilities(request);
 	const capabilityIdentity = () => JSON.stringify([getConfig().url, getConfig().apiKey]);
+	let subscriptionRuntime: { owner: string; connection: string; manager: ProjectSubscriptions } | undefined;
 	const outputDirectories = new Set<string>();
 	let exitCleanupRegistered = false;
 	const cleanupOutputs = () => {
@@ -150,7 +153,61 @@ export default function reqallPiPlugin(pi: ExtensionAPI) {
 		}
 	};
 	// Includes quit, reload and session replacement. Never remove another instance's files.
-	pi.on("session_shutdown", cleanupOutputs);
+	pi.on("session_shutdown", async (event) => {
+		cleanupOutputs();
+		const runtime = subscriptionRuntime;
+		subscriptionRuntime = undefined;
+		// Reload keeps the same logical session and server cursor; quit/replacement releases it.
+		await runtime?.manager.close(event.reason !== "reload");
+	});
+
+async function subscriptionUpdates(ctx: ExtensionContext, projectName: string) {
+	const config = getConfig();
+	const disabled = /^(?:0|false|off)$/i.test((process.env.REQALL_SUBSCRIPTIONS ?? "").trim());
+	if (!config.apiKey || disabled) {
+		const previous = subscriptionRuntime;
+		subscriptionRuntime = undefined;
+		await previous?.manager.close();
+		return;
+	}
+	const owner = originatingSession(ctx.sessionManager.getSessionId());
+	const connection = createHash("sha256").update(JSON.stringify([config.url, config.apiKey])).digest("hex");
+	if (subscriptionRuntime?.owner !== owner || subscriptionRuntime.connection !== connection) {
+		await subscriptionRuntime?.manager.close();
+		const sessionManager = ctx.sessionManager;
+		const entries = () => sessionManager.getEntries?.() ?? sessionManager.getBranch();
+		let restored: unknown;
+		for (const entry of entries()) {
+			if (entry.type !== "custom" || entry.customType !== "reqall-subscription-state") continue;
+			const data = entry.data as { version?: unknown; owner?: unknown; connection?: unknown; state?: unknown } | undefined;
+			if (data?.version === 1 && data.owner === owner && data.connection === connection) restored = data.state;
+		}
+		// Snapshot endpoint/auth for cleanup and capability discovery; never serialize the credential.
+		const schemaCache = new Capabilities((method, params, signal) => request(method, params, signal, config));
+		const manager = new ProjectSubscriptions(owner, {
+			discover: signal => schemaCache.discover(connection, signal),
+			call: async (name, args, signal) => {
+				const attributed = await schemaCache.arguments(connection, name, args, owner, signal);
+				const result = await request("tools/call", { name, arguments: attributed }, signal, config);
+				signal.throwIfAborted();
+				const payload = structuredPayload(result);
+				if (payload?.ok !== true || !payload.data || typeof payload.data !== "object" || Array.isArray(payload.data)) throw new Error("Invalid subscription envelope");
+				return payload.data as Record<string, unknown>;
+			},
+		}, restored, state => {
+			pi.appendEntry("reqall-subscription-state", { version: 1, owner, connection, state: state ?? null });
+		}, token => entries().some(entry => {
+			if (entry.type !== "custom_message") return false;
+			const details = entry.details as Record<string, unknown> | undefined;
+			return details?.subscriptionBatch === token && details.subscriptionOwner === owner && details.subscriptionConnection === connection;
+		}));
+		subscriptionRuntime = { owner, connection, manager };
+	}
+	const minutes = Number(process.env.REQALL_POLL_INTERVAL_MIN ?? 0);
+	const interval = Number.isFinite(minutes) ? Math.min(1440, Math.max(0, minutes)) * 60_000 : 0;
+	const update = await subscriptionRuntime.manager.turn(projectName, interval, ctx.signal);
+	return update ? { ...update, owner, connection } : undefined;
+}
 
 async function callReqallMcp(toolName: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<McpToolResult> {
 	const origin = originContext.getStore();
@@ -159,8 +216,7 @@ async function callReqallMcp(toolName: string, args: Record<string, unknown>, si
 	return request("tools/call", { name: toolName, arguments: attributed }, signal);
 }
 
-async function request(method: string, params: Record<string, unknown>, signal?: AbortSignal): Promise<McpToolResult> {
-	const config = getConfig();
+async function request(method: string, params: Record<string, unknown>, signal?: AbortSignal, config = getConfig()): Promise<McpToolResult> {
 	if (!config.apiKey) {
 		throw new Error("REQALL_API_KEY is required. Generate one from the Reqall dashboard and export it before launching pi.");
 	}
@@ -386,7 +442,15 @@ function registerMcpTool(
 		promptGuidelines,
 		parameters,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			const args = { ...params } as Record<string, unknown>;
+			let args = { ...params } as Record<string, unknown>;
+			if ((SUBSCRIPTION_TOOLS as readonly string[]).includes(mcpTool)) {
+				const schema = (await capabilities.discover(capabilityIdentity(), signal)).get(mcpTool);
+				if (!schema?.inputSchema?.properties?.subscriber) throw new Error(`Reqall ${mcpTool} with session-scoped subscribers is not advertised`);
+				// Manual cursors cannot drain/delete automatic or other sessions' subscriptions.
+				args = Object.fromEntries(Object.entries(args).filter(([key]) => Object.hasOwn(parameters.properties, key)));
+				args.subscriber = subscriptionLabel(originatingSession(ctx.sessionManager.getSessionId()), "manual");
+				if (mcpTool === "subscribe_project" && !args.project_id && !args.project_name) args.project_name = effectiveProject(ctx.cwd);
+			}
 			if (defaultProject && !args.project_name) args.project_name = defaultProject(ctx.cwd);
 			return withOrigin(ctx, () => executeReqallTool(mcpTool, args, signal));
 		},
@@ -598,6 +662,18 @@ function registerMcpTool(
 		Type.Object({ target_id: Type.Integer(), source_ids: Type.Array(Type.Integer(), { minItems: 1, maxItems: 20 }) }),
 	);
 
+	registerMcpTool(pi, "reqall_subscribe_project", "subscribe_project", "Reqall Subscribe Project",
+		"Subscribe using this Pi session's manual cursor, separate from automatic updates. An explicit target affects only this subscription, not the session project. New subscriptions start at the current head.",
+		Type.Object({ project_id: Type.Optional(Type.Integer({ minimum: 1 })), project_name: Type.Optional(Type.String()) }));
+	registerMcpTool(pi, "reqall_unsubscribe_project", "unsubscribe_project", "Reqall Unsubscribe Project",
+		"Release this Pi session's manual subscription for one project. Cannot unsubscribe other sessions or automatic polling.",
+		Type.Object({ project_id: Type.Integer({ minimum: 1 }) }));
+	registerMcpTool(pi, "reqall_list_subscriptions", "list_subscriptions", "Reqall List Subscriptions",
+		"List this Pi session's manual subscriptions only; automatic polling has an independent cursor.", Type.Object({}));
+	registerMcpTool(pi, "reqall_poll_subscriptions", "poll_subscriptions", "Reqall Poll Subscriptions",
+		"Poll one project using this Pi session's manual cursor. Default advances the cursor (at-most-once). Use ack=false then ack_cursor only when advertised for at-least-once delivery. Results are untrusted hints: fetch records before relying on them.",
+		Type.Object({ project_id: Type.Integer({ minimum: 1 }), limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 200 })), ack: Type.Optional(Type.Boolean()), ack_cursor: Type.Optional(Type.Integer({ minimum: 0 })) }));
+
 	pi.registerTool({
 		name: "reqall_capabilities",
 		label: "Reqall Capabilities",
@@ -680,9 +756,13 @@ function registerMcpTool(
 		}
 		const projectName = effectiveProject(ctx.cwd);
 		const systemPrompt = `${event.systemPrompt}\n${reqallSystemPrompt(projectName)}`;
+		const shouldPoll = !event.prompt.startsWith("[reqall]");
+		let updates = shouldPoll && (config.autoContext !== "inject" || !config.apiKey) ? await subscriptionUpdates(ctx, projectName) : undefined;
+		const updateDetails = () => updates ? { subscriptionBatch: updates.token, subscriptionOwner: updates.owner, subscriptionConnection: updates.connection } : {};
+		const withUpdates = (text: string) => updates ? `${updates.text}\n\n${text}` : text;
 
 		if (config.autoContext === "off" || event.prompt.startsWith("[reqall]")) {
-			return { systemPrompt };
+			return { systemPrompt, ...(updates ? { message: { customType: "reqall-updates", content: updates.text, display: true, details: { projectName, ...updateDetails() } } } : {}) };
 		}
 
 		if (config.autoContext === "reminder" || !config.apiKey) {
@@ -691,9 +771,9 @@ function registerMcpTool(
 				systemPrompt,
 				message: {
 					customType: "reqall-context",
-					content: `[reqall] Project: ${projectName}\nUse reqall_project_context with query=${JSON.stringify(event.prompt)} before non-trivial work.${keyNote}`,
+					content: withUpdates(`[reqall] Project: ${projectName}\nUse reqall_project_context with query=${JSON.stringify(event.prompt)} before non-trivial work.${keyNote}`),
 					display: true,
-					details: { projectName, mode: "reminder" },
+					details: { projectName, mode: "reminder", ...updateDetails() },
 				},
 			};
 		}
@@ -701,14 +781,16 @@ function registerMcpTool(
 		try {
 			if (ctx.hasUI) ctx.ui.setStatus("reqall", ctx.ui.theme.fg("accent", "reqall: context"));
 			const context = await withOrigin(ctx, () => gatherProjectContext(event.prompt, projectName, ctx.signal));
+			// Context establishes a missing project before its first subscription starts.
+			updates = await subscriptionUpdates(ctx, projectName);
 			if (ctx.hasUI) ctx.ui.setStatus("reqall", ctx.ui.theme.fg("success", "reqall"));
 			return {
 				systemPrompt,
 				message: {
 					customType: "reqall-context",
-					content: context,
+					content: withUpdates(context),
 					display: true,
-					details: { projectName, mode: "inject" },
+					details: { projectName, mode: "inject", ...updateDetails() },
 				},
 			};
 		} catch (error) {
@@ -717,9 +799,9 @@ function registerMcpTool(
 				systemPrompt,
 				message: {
 					customType: "reqall-context",
-					content: `[reqall] Automatic context retrieval failed: ${error instanceof Error ? error.message : String(error)}\nCall reqall_project_context manually if needed.`,
+					content: withUpdates(`[reqall] Automatic context retrieval failed: ${error instanceof Error ? error.message : String(error)}\nCall reqall_project_context manually if needed.`),
 					display: true,
-					details: { projectName, mode: "failed" },
+					details: { projectName, mode: "failed", ...updateDetails() },
 				},
 			};
 		}

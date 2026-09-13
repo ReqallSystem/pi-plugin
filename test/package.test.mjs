@@ -27,7 +27,7 @@ test('npm tarball ships policy and seven aligned skills and loads through Pi', a
     assert.deepEqual(loaded.errors, []);
     assert.equal(loaded.extensions.length, 1);
     const extension = loaded.extensions[0];
-    assert.deepEqual([...extension.tools.keys()].sort(), ['reqall_search', 'reqall_upsert_project', 'reqall_upsert_record', 'reqall_get_record', 'reqall_list_records', 'reqall_list_projects', 'reqall_upsert_link', 'reqall_list_links', 'reqall_impact', 'reqall_delete_record', 'reqall_delete_link', 'reqall_sleep_candidates', 'reqall_sleep_apply', 'reqall_project_context', 'reqall_capabilities', 'reqall_merge_projects'].sort());
+    assert.deepEqual([...extension.tools.keys()].sort(), ['reqall_search', 'reqall_upsert_project', 'reqall_upsert_record', 'reqall_get_record', 'reqall_list_records', 'reqall_list_projects', 'reqall_upsert_link', 'reqall_list_links', 'reqall_impact', 'reqall_delete_record', 'reqall_delete_link', 'reqall_sleep_candidates', 'reqall_sleep_apply', 'reqall_project_context', 'reqall_capabilities', 'reqall_merge_projects', 'reqall_subscribe_project', 'reqall_unsubscribe_project', 'reqall_list_subscriptions', 'reqall_poll_subscriptions'].sort());
     assert.equal(extension.commands.size, 6);
     const recordSchema = extension.tools.get('reqall_upsert_record').definition.parameters;
     assert.equal(recordSchema.properties.links.maxItems, 20);
@@ -39,7 +39,7 @@ test('npm tarball ships policy and seven aligned skills and loads through Pi', a
     assert.ok(extension.handlers.has('before_agent_start'));
     const childEnv = { ...process.env, REQALL_TEST_PACKAGE: root };
     delete childEnv.NODE_TEST_CONTEXT; // Otherwise Node silently skips nested --test runs.
-    const output = execFileSync(process.execPath, ['--test', 'test/runtime.test.mjs', 'test/lifecycle.test.mjs', 'test/attribution.test.mjs'], { env: childEnv, encoding: 'utf8' });
+    const output = execFileSync(process.execPath, ['--test', 'test/runtime.test.mjs', 'test/lifecycle.test.mjs', 'test/attribution.test.mjs', 'test/subscriptions.test.mjs'], { env: childEnv, encoding: 'utf8' });
     assert.match(output, /(?:#|ℹ) fail 0/);
     console.log('Packaged routing suite:\n' + output);
   } finally { rmSync(temp, { recursive: true, force: true }); }

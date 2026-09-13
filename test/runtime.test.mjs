@@ -9,7 +9,7 @@ import ts from 'typescript';
 
 const source = resolve(process.env.REQALL_TEST_PACKAGE || '.');
 const compiled = mkdtempSync(resolve('.runtime-test-'));
-for (const name of ['reqall', 'project-policy', 'capabilities']) {
+for (const name of ['reqall', 'project-policy', 'capabilities', 'subscriptions']) {
   const text = readFileSync(join(source, 'extensions', `${name}.ts`), 'utf8');
   writeFileSync(join(compiled, `${name}.js`), ts.transpileModule(text, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 } }).outputText);
 }

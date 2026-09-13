@@ -12,6 +12,7 @@ unreleased changes; this is not a claim about marketplace deployments.
 | Session lifecycle | Host UUID survives reload/resume/compaction/project changes; new/fork sessions get distinct labels. No credentials, paths or raw host IDs in labels. |
 | Schema parity | `work`/`info`, inline links (20 maximum), strict-project search, confirmed project merges and `reqall_capabilities`. Additive arguments require positive advertisement. |
 | Response handling | Structured and JSON-text project identities and errors; structured partial link results remain visible; bounded output; matching RPC IDs; deadlines and refused redirects. |
+| Subscriptions | Automatic schema-gated project subscriptions, five-event polling, persisted-message acknowledgement, strict own-session filtering, reload/rebind/cleanup and isolated manual tools. |
 | Intent | New Pi-native command/skill. Reuse one agreed spec/arch, skip chores/questions; preserve the effective binding. |
 | Persistence | Guidance for outcome/intent reconciliation, exact record and paginated link readback, same-ID partial-save repair, legacy kind/link fallback, honest failure disclosure. |
 | SLEEP | Modern work-log promotion/discard guidance; inspect advertised schemas/candidates; explicit project-merge confirmation. `sleep_candidates` is not described as strictly read-only. |
@@ -19,15 +20,12 @@ unreleased changes; this is not a claim about marketplace deployments.
 
 ## Remaining gaps (not implemented or claimed)
 
-1. **Automatic project subscriptions.** Claude/Codex subscribe/poll at turn
-   boundaries and manage project-specific cursors. Pi has no subscription
-   wrappers or background polling yet. Add schema-discovered tools, bounded
-   event pages, durable acknowledgement/deduplication state, project rebind and
-   shutdown cleanup. Keep subscriber/cursor identity separate from write origin.
-   Only suppress `actor=self` AND exact non-null own `session_id`. Retain unknown,
-   legacy, other-account and other-session edits even to a record we wrote.
-   `isOwnEvent` is tested groundwork, not an active notification pipeline. Do not
-   copy Claude's older own-record-ID heuristic, even as a legacy fallback.
+1. **Subscription extensions.** Automatic turn-boundary polling and scoped manual
+   tools are now implemented. Native resource/SSE push, cross-process arbitration
+   for two processes opening the exact same Pi session, and offline replay after
+   a successfully released cursor remain outside this implementation. Legacy
+   servers cannot recover claim-and-advance pages lost on the wire. Manual cursors
+   intentionally remain explicitly managed; automatic cleanup never deletes them.
 2. **Enforced, branch-local persistence.** Codex tracks work revisions,
    commitments, partial saves and verified readbacks; Claude uses bounded Stop
    retries and intent tracking. Pi currently offers prompt guidance and the
@@ -60,9 +58,9 @@ unreleased changes; this is not a claim about marketplace deployments.
 
 ## Verification and boundaries
 
-- `npm test`: TypeScript, 14 routing/lifecycle/attribution tests on source and
-  again on the extracted npm package, plus package assertions (15 top-level
-  tests). All network tests use an asserted fixture-only endpoint.
+- `npm test`: TypeScript and routing/lifecycle/attribution/subscription tests on
+  source and again on the extracted npm package, plus package assertions. All
+  network tests use an asserted fixture-only endpoint.
 - Real Pi SessionManager persistence is exercised for resume/reload and forks;
   compaction and new sessions preserve/renew origin as appropriate. Two sessions
   on one account write the same record concurrently with distinct labels.
@@ -75,6 +73,16 @@ unreleased changes; this is not a claim about marketplace deployments.
   instance-isolated and removed on all shutdown reasons and real child-process
   exit. Listeners are registered lazily and removed after cleanup. Reload/resume
   requires fetching a fresh result rather than reusing a removed temporary path.
+- Subscription tests cover receipt-before-ack, replay/reload/compaction/tree/fork,
+  same-record concurrent sessions, manual/automatic cursor separation, old-server
+  fallback, lost responses/enrollments, scope/shape validation, opt-out/throttling,
+  credential-boundary isolation, failed cleanup and cancellation. No production
+  subscriptions were created during development.
+- PR #2's rebind regression reproduces pending-page loss before the fix. Tests
+  cover live/restored and modern/legacy pages, repeated replay, cleanup failure,
+  and the actual Pi loader with repeated disk reloads before/after receipt. The
+  old page is labelled explicitly while the new effective binding stays intact;
+  rebind proceeds only after the matching receipt is persisted.
 - Installed pi 0.85.1: isolated offline RPC startup loaded all six commands with
   no extension errors and no Reqall/provider request. Existing 0.73-era dev
   dependencies remain; this smoke check is not a full multi-version SDK matrix.
