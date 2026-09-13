@@ -9,7 +9,7 @@ import ts from 'typescript';
 
 const source = resolve(process.env.REQALL_TEST_PACKAGE || '.');
 const compiled = mkdtempSync(resolve('.runtime-test-'));
-for (const name of ['reqall', 'project-policy']) {
+for (const name of ['reqall', 'project-policy', 'capabilities']) {
   const text = readFileSync(join(source, 'extensions', `${name}.ts`), 'utf8');
   writeFileSync(join(compiled, `${name}.js`), ts.transpileModule(text, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 } }).outputText);
 }
@@ -25,12 +25,14 @@ test('actual Pi handlers retain labelled selection across context and workflows'
     Object.assign(process.env, { REQALL_API_KEY: 'fixture-only', REQALL_URL: 'http://fixture.invalid', REQALL_AUTO_PERSIST: 'followup' });
     globalThis.fetch = async (url, options) => {
       assert.equal(url, 'http://fixture.invalid/mcp');
-      const rpc = JSON.parse(options.body); calls.push(rpc.params);
+      const rpc = JSON.parse(options.body);
+      if (rpc.method === 'tools/list') return new Response(JSON.stringify({ jsonrpc: '2.0', id: rpc.id, result: { tools: [] } }));
+      calls.push(rpc.params);
       return new Response(JSON.stringify({ jsonrpc: '2.0', id: rpc.id, result: { content: [{ type: 'text', text: rpc.params.name === 'upsert_project' ? 'Project #42' : '[]' }] } }));
     };
     const entries = [];
     plugin({ appendEntry: (customType, data) => entries.push({ type: 'custom', customType, data }), on: (name, fn) => events.set(name, fn), registerTool: t => tools.set(t.name, t), registerCommand: (name, c) => commands.set(name, c), sendMessage: m => messages.push(m.content), sendUserMessage: m => messages.push(m) });
-    const ctx = { cwd, hasUI: false, sessionManager: { getBranch: () => entries } };
+    const ctx = { cwd, hasUI: false, sessionManager: { getBranch: () => entries, getSessionId: () => 'fixture-session' } };
     await events.get('session_start')({ type: 'session_start', reason: 'startup' }, ctx);
     // Existing host must actually register a supported user-input hook.
     assert.equal(typeof events.get('input'), 'function');

@@ -1,9 +1,14 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Capabilities, originatingSession } from "./capabilities.js";
 import { extractProjectHint, resolveProjectBinding } from "./project-policy.js";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { Type } from "typebox";
 
-const VALID_KINDS = ["issue", "spec", "arch", "test", "todo"] as const;
+const VALID_KINDS = ["issue", "spec", "arch", "test", "todo", "info", "work"] as const;
 const VALID_KINDS_WITH_ALL = [...VALID_KINDS, "all"] as const;
 const VALID_STATUSES = ["open", "resolved", "archived", "active", "inactive"] as const;
 const VALID_STATUSES_WITH_ALL = [...VALID_STATUSES, "all"] as const;
@@ -100,7 +105,7 @@ function parseSseResponse(text: string, id: number): JsonRpcResponse | undefined
 	}
 	flush();
 
-	return responses.find((response) => response.id === id) ?? responses.find((response) => response.result || response.error);
+	return responses.find((response) => response.id === id);
 }
 
 function parseJsonRpcResponse(text: string, id: number): JsonRpcResponse {
@@ -115,14 +120,30 @@ function parseJsonRpcResponse(text: string, id: number): JsonRpcResponse {
 
 	const parsed = JSON.parse(trimmed) as JsonRpcResponse | JsonRpcResponse[];
 	if (Array.isArray(parsed)) {
-		const match = parsed.find((response) => response.id === id) ?? parsed[0];
+		const match = parsed.find((response) => response.id === id);
 		if (!match) throw new Error("Reqall MCP returned an empty JSON-RPC batch");
 		return match;
 	}
+	if (parsed.id !== id) throw new Error("Reqall MCP response id mismatch");
 	return parsed;
 }
 
+export default function reqallPiPlugin(pi: ExtensionAPI) {
+	// Invocation-local identity survives awaits without leaking between parallel calls.
+	const originContext = new AsyncLocalStorage<string>();
+	const withOrigin = <T>(ctx: ExtensionContext, fn: () => T): T =>
+		originContext.run(originatingSession(ctx.sessionManager.getSessionId()), fn);
+	const capabilities = new Capabilities(request);
+	const capabilityIdentity = () => JSON.stringify([getConfig().url, getConfig().apiKey]);
+
 async function callReqallMcp(toolName: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<McpToolResult> {
+	const origin = originContext.getStore();
+	if (!origin) throw new Error("Reqall call has no originating Pi session");
+	const attributed = await capabilities.arguments(capabilityIdentity(), toolName, args, origin, signal);
+	return request("tools/call", { name: toolName, arguments: attributed }, signal);
+}
+
+async function request(method: string, params: Record<string, unknown>, signal?: AbortSignal): Promise<McpToolResult> {
 	const config = getConfig();
 	if (!config.apiKey) {
 		throw new Error("REQALL_API_KEY is required. Generate one from the Reqall dashboard and export it before launching pi.");
@@ -131,7 +152,8 @@ async function callReqallMcp(toolName: string, args: Record<string, unknown>, si
 	const id = Date.now() + Math.floor(Math.random() * 1000);
 	const response = await fetch(`${config.url}/mcp`, {
 		method: "POST",
-		signal,
+		signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(15_000)]) : AbortSignal.timeout(15_000),
+		redirect: "error",
 		headers: {
 			"Authorization": `Bearer ${config.apiKey}`,
 			"Content-Type": "application/json",
@@ -141,8 +163,8 @@ async function callReqallMcp(toolName: string, args: Record<string, unknown>, si
 		body: JSON.stringify({
 			jsonrpc: "2.0",
 			id,
-			method: "tools/call",
-			params: { name: toolName, arguments: args },
+			method,
+			params,
 		}),
 	});
 
@@ -163,15 +185,36 @@ async function callReqallMcp(toolName: string, args: Record<string, unknown>, si
 		throw new Error(`Reqall MCP error ${rpc.error.code ?? ""}: ${rpc.error.message ?? "unknown error"}`.trim());
 	}
 	if (!rpc.result) throw new Error("Reqall MCP response did not include a tool result");
-	if (rpc.result.isError) throw new Error(contentToText(rpc.result) || `Reqall tool ${toolName} failed`);
+	if (rpc.result.isError || structuredPayload(rpc.result)?.ok === false) {
+		throw new Error(contentToText(rpc.result) || `Reqall ${method} failed`);
+	}
 	return rpc.result;
 }
 
+function structuredPayload(result: McpToolResult): Record<string, any> | undefined {
+	if (result.structuredContent && typeof result.structuredContent === "object") return result.structuredContent as Record<string, any>;
+	try {
+		const parsed = JSON.parse(contentToText(result));
+		if (parsed && typeof parsed === "object") return parsed;
+	} catch { /* Older servers return human-readable text. */ }
+	return undefined;
+}
+
+function boundedText(full: string): string {
+	let text = full;
+	if (full.length > 12_000) {
+		const path = join(mkdtempSync(join(tmpdir(), "reqall-output-")), "result.txt");
+		writeFileSync(path, full, { mode: 0o600 });
+		text = `${full.slice(0, 12_000)}\n[Reqall output truncated; full result: ${path}. Read it before verification.]`;
+	}
+	return text;
+}
+
 function toPiToolResult(toolName: string, result: McpToolResult): PiToolResult {
-	const text = contentToText(result) || "(Reqall returned no text output.)";
+	const full = [contentToText(result), result.structuredContent ? JSON.stringify(result.structuredContent) : ""].filter(Boolean).join("\n\n") || "(Reqall returned no text output.)";
 	return {
-		content: [{ type: "text", text }],
-		details: { reqallTool: toolName },
+		content: [{ type: "text", text: boundedText(full) }],
+		details: { reqallTool: toolName, structuredContent: result.structuredContent },
 	};
 }
 
@@ -199,7 +242,9 @@ async function resolveProjectId(projectName: string, signal?: AbortSignal): Prom
 	try {
 		const upsert = await callReqallMcp("upsert_project", { name: projectName }, signal);
 		projectText = contentToText(upsert);
-		return { projectId: parseProjectId(projectText), projectText };
+		const project = structuredPayload(upsert)?.data?.project;
+		const projectId = Number.isSafeInteger(project?.id) && project.id > 0 ? project.id : parseProjectId(projectText);
+		if (projectId !== undefined) return { projectId, projectText };
 	} catch (error) {
 		projectText = `Project upsert skipped/failed: ${error instanceof Error ? error.message : String(error)}`;
 	}
@@ -207,7 +252,9 @@ async function resolveProjectId(projectName: string, signal?: AbortSignal): Prom
 	try {
 		const projects = await callReqallMcp("list_projects", {}, signal);
 		const listText = contentToText(projects);
-		return { projectId: parseProjectIdFromList(listText, projectName), projectText: `${projectText}\n${listText}`.trim() };
+		const projectsData = structuredPayload(projects)?.data?.projects;
+		const project = Array.isArray(projectsData) ? projectsData.find(p => p.name === projectName && Number.isSafeInteger(p.id) && p.id > 0) : undefined;
+		return { projectId: project?.id ?? parseProjectIdFromList(listText, projectName), projectText: `${projectText}\n${listText}`.trim() };
 	} catch {
 		return { projectText };
 	}
@@ -246,7 +293,7 @@ async function gatherProjectContext(query: string, projectName: string, signal?:
 		sections.push("## Open Records\nProject id unavailable; call reqall_list_projects or reqall_upsert_project if open-record enumeration is needed.");
 	}
 
-	return sections.join("\n\n");
+	return boundedText(sections.join("\n\n"));
 }
 
 function reqallSystemPrompt(projectName: string): string {
@@ -257,12 +304,16 @@ Reqall is available through Pi tools named \`reqall_*\`. Current project name: \
 
 For non-trivial coding, bug fixing, refactoring, migration, architecture/spec, or test work:
 1. At task start, use injected Reqall context if present. If context was not injected, call \`reqall_project_context\` with the user's task and project_name=\`${projectName}\`.
-2. Before modifying a file or tracked behavior, call \`reqall_search\` with the file path, component, or behavior to find related specs/issues/architecture decisions.
+2. For agreed non-trivial new behavior or architecture, follow the reqall-intend skill: search/reuse or create one spec/arch with acceptance criteria before implementation. Skip chores, questions and routine fixes. Before modifying a file or tracked behavior, call \`reqall_search\` with the file path, component, or behavior to find related specs/issues/architecture decisions.
 3. Before your final response, persist meaningful completed work. Call \`reqall_upsert_project\` for \`${projectName}\`, then create/update one Reqall record per distinct work item with \`reqall_upsert_record\`; link related records with \`reqall_upsert_link\` when relationships are clear.
 4. Persist verification evidence from tests/builds as kind=\`test\` when useful.
 5. Prefer status transitions (resolved/archived) over deletion. Only call \`reqall_delete_record\` or \`reqall_delete_link\` when the user explicitly asks.
 
-Classification defaults: bug fix -> issue/resolved; new unfixed bug -> issue/open; completed implementation -> todo/resolved; follow-up -> todo/open; architecture decision -> arch/resolved; new/updated spec -> spec/open; test/build evidence -> test/active or test/resolved.
+Call reqall_capabilities before using additive features. Prefer work/resolved for session outcomes and info for durable reference notes only when advertised; legacy outcomes use todo/resolved. Inline links require advertised support. Link fulfilled intent with implements, tests with tests, and open gaps with todo --blocks--> intent. Inspect every inline link result; repair partial saves using existing record IDs, never duplicate creates. Verify each record with reqall_get_record and all relevant reqall_list_links pages, then project-scoped reqall_list_records. Transport success alone is not verified persistence. Disclose failures; do not claim memory was saved when unavailable.
+
+Session attribution is injected automatically by the transport only for schemas advertising session_id; do not supply your own. It is untrusted correlation metadata, not authorization or a subscription cursor.
+
+Classification defaults: bug fix -> issue/resolved; new unfixed bug -> issue/open; follow-up -> todo/open; architecture decision -> arch/resolved; new/updated spec -> spec/open; test/build evidence -> test/active or test/resolved. Successful routine git add/commit/push bookkeeping alone does not merit another record; keep existing pending work.
 `;
 }
 
@@ -274,7 +325,7 @@ Classify and persist all meaningful work completed in this Pi session:
 2. Identify distinct work items (files changed, bugs fixed/discovered, specs/architecture decisions, tests run/added, follow-up tasks).
 3. For each non-trivial item, call reqall_upsert_record with the appropriate kind/status/title/body.
 4. Search for related records and call reqall_upsert_link when a clear relationship exists.
-5. Call reqall_list_records with the project_id to verify the records were persisted.
+5. Reconcile agreed intent: outcomes implement it, tests test it, and open todos block remaining gaps. Prefer advertised work/info kinds and inline links after reqall_capabilities; otherwise use legacy kinds and reqall_upsert_link. Inspect every link result, repair with existing IDs, read back each record and all relevant link pages, then call reqall_list_records with the project_id. Report partial persistence honestly.
 6. Report what was persisted and any remaining open follow-ups.
 
 ${summary ? `User-provided summary:\n${summary}` : "Use the conversation and tool history as the source of truth."}`;
@@ -315,12 +366,11 @@ function registerMcpTool(
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const args = { ...params } as Record<string, unknown>;
 			if (defaultProject && !args.project_name) args.project_name = defaultProject(ctx.cwd);
-			return executeReqallTool(mcpTool, args, signal);
+			return withOrigin(ctx, () => executeReqallTool(mcpTool, args, signal));
 		},
 	});
 }
 
-export default function reqallPiPlugin(pi: ExtensionAPI) {
 	let persistFollowupInProgress = false;
 	let selectedProject = "";
 	let pendingProject = "";
@@ -331,7 +381,7 @@ export default function reqallPiPlugin(pi: ExtensionAPI) {
 	// InputEvent.source distinguishes user input from extension-generated followups.
 	pi.on("input", async (event) => {
 		// Skill arguments describe one operation, not a session project switch.
-		const skillOperation = /^\/skill:reqall-(?:context|persist|document|review|triage|sleep)(?:\s|$)/.test(event.text);
+		const skillOperation = /^\/skill:reqall-(?:context|intend|persist|document|review|triage|sleep)(?:\s|$)/.test(event.text);
 		if (event.source !== "extension" && !skillOperation) {
 			const hint = extractProjectHint(event.text);
 			if (hint) pendingProject = hint;
@@ -349,6 +399,7 @@ export default function reqallPiPlugin(pi: ExtensionAPI) {
 			query: Type.String({ description: "Natural language query; describe what you need conceptually, or pass a file path/component name before modifying it." }),
 			kind: Type.Optional(StringEnum(VALID_KINDS_WITH_ALL)),
 			project_name: Type.Optional(Type.String({ description: "Project name (e.g. org/repo) to prefer in results; other projects can still appear." })),
+			project_only: Type.Optional(Type.Boolean({ description: "Restrict results to project_name; requires advertised server support." })),
 			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 100, description: "Max results (default 5)." })),
 		}),
 		"Search persistent Reqall memory for relevant records",
@@ -382,6 +433,12 @@ export default function reqallPiPlugin(pi: ExtensionAPI) {
 			title: Type.Optional(Type.String({ maxLength: 500, description: "Short title with prefix like BUG:, TASK:, ARCH:, FEAT:, REFACTOR:, TEST:. Required for create." })),
 			body: Type.Optional(Type.String({ maxLength: 32000, description: "Detailed context, rationale, file paths, commands, outcomes, and follow-ups." })),
 			status: Type.Optional(StringEnum(VALID_STATUSES)),
+			links: Type.Optional(Type.Array(Type.Object({
+				target_id: Type.Integer(),
+				target_table: Type.Optional(StringEnum(VALID_ENTITY_TYPES)),
+				relationship: StringEnum(VALID_RELATIONSHIPS),
+				direction: Type.Optional(StringEnum(["outgoing", "incoming"] as const)),
+			}), { maxItems: 20, description: "Inline links, only when reqall_capabilities advertises support. Inspect each link result; partial errors require same-ID repair." })),
 		}),
 		"Persist completed work, decisions, specs, issues, todos, and tests",
 		["Use reqall_upsert_record before the final response to persist meaningful non-trivial work completed in the session."],
@@ -495,7 +552,7 @@ export default function reqallPiPlugin(pi: ExtensionAPI) {
 		"reqall_sleep_candidates",
 		"sleep_candidates",
 		"Reqall SLEEP Candidates",
-		"Analyze a project for knowledge-graph maintenance candidates: consolidation, rollups, splits, and cross-project links. Read-only and rate-limited; use reqall_sleep_apply to apply accepted operations.",
+		"Analyze a project for knowledge-graph maintenance candidates. May refresh density/link-diff audits; rate-limited, not strictly read-only. Inspect returned operations before reqall_sleep_apply.",
 		Type.Object({ project_id: Type.Integer({ description: "Project ID to analyze." }) }),
 		"Find Reqall knowledge-graph maintenance candidates",
 	);
@@ -508,10 +565,37 @@ export default function reqallPiPlugin(pi: ExtensionAPI) {
 		"Apply SLEEP knowledge-graph maintenance operations. Safety invariants are enforced server-side. Use only after inspecting reqall_sleep_candidates and reasoning about operations.",
 		Type.Object({
 			project_id: Type.Integer({ description: "Project ID." }),
-			operations: Type.Array(Type.Any({ description: "Operations from the SLEEP workflow: consolidate, compact, skip, split, or crosslink." })),
+			operations: Type.Array(Type.Any({ description: "Server-supported SLEEP operations from inspected candidates; may include promote/discard work logs and merge_projects. Never invent unsupported operation shapes." })),
 		}),
 		"Apply Reqall knowledge-graph maintenance operations",
 	);
+
+	registerMcpTool(
+		pi, "reqall_merge_projects", "merge_projects", "Reqall Merge Projects",
+		"Irreversibly merge owned source projects into target_id, deleting sources. Only after explicit user confirmation. Requires advertised server support.",
+		Type.Object({ target_id: Type.Integer(), source_ids: Type.Array(Type.Integer(), { minItems: 1, maxItems: 20 }) }),
+	);
+
+	pi.registerTool({
+		name: "reqall_capabilities",
+		label: "Reqall Capabilities",
+		description: "Discover server tool schemas before using work/info kinds, inline links or project_only. Attribution is injected automatically when advertised; never supply a session_id yourself.",
+		parameters: Type.Object({ tool_name: Type.Optional(Type.String({ description: "MCP tool name (without reqall_) for its full advertised schema, e.g. sleep_apply." })) }),
+		async execute(_id, params, signal) {
+			const tools = await capabilities.discover(capabilityIdentity(), signal);
+			const summary = params.tool_name
+				? tools.get(params.tool_name) ?? { unavailable: params.tool_name }
+				: [...tools.values()].map(t => ({ name: t.name, fields: Object.keys(t.inputSchema?.properties || {}), kinds: t.inputSchema?.properties?.kind?.enum }));
+			return toPiToolResult("capabilities", { content: [{ type: "text", text: JSON.stringify(summary) }] });
+		},
+	});
+
+	pi.registerCommand("reqall-intend", {
+		description: "Record agreed behavior or architecture before implementation",
+		handler: async (args, ctx) => {
+			pi.sendUserMessage(`[reqall] Record agreed intent for project_name=${JSON.stringify(effectiveProject(ctx.cwd))}. ${args.trim()}\nRead the reqall-intend skill. Search first; reuse or create one spec/arch with acceptance criteria only for agreed non-trivial behavior/architecture, not chores or questions. Reconcile outcomes against it before final handoff.`);
+		},
+	});
 
 	pi.registerTool({
 		name: "reqall_project_context",
@@ -525,7 +609,7 @@ export default function reqallPiPlugin(pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const input = params as { query: string; project_name?: string };
-			const text = await gatherProjectContext(input.query, input.project_name?.trim() || effectiveProject(ctx.cwd), signal);
+			const text = await withOrigin(ctx, () => gatherProjectContext(input.query, input.project_name?.trim() || effectiveProject(ctx.cwd), signal));
 			return { content: [{ type: "text", text }], details: { reqallTool: "project_context" } };
 		},
 	});
@@ -594,7 +678,7 @@ export default function reqallPiPlugin(pi: ExtensionAPI) {
 
 		try {
 			if (ctx.hasUI) ctx.ui.setStatus("reqall", ctx.ui.theme.fg("accent", "reqall: context"));
-			const context = await gatherProjectContext(event.prompt, projectName, ctx.signal);
+			const context = await withOrigin(ctx, () => gatherProjectContext(event.prompt, projectName, ctx.signal));
 			if (ctx.hasUI) ctx.ui.setStatus("reqall", ctx.ui.theme.fg("success", "reqall"));
 			return {
 				systemPrompt,
@@ -644,7 +728,7 @@ export default function reqallPiPlugin(pi: ExtensionAPI) {
 		description: "Fetch Reqall context for this project and query",
 		handler: async (args, ctx) => {
 			const query = args.trim() || (ctx.hasUI ? ctx.ui.getEditorText() : "") || "current project context";
-			const context = await gatherProjectContext(query, effectiveProject(ctx.cwd), ctx.signal);
+			const context = await withOrigin(ctx, () => gatherProjectContext(query, effectiveProject(ctx.cwd), ctx.signal));
 			pi.sendMessage({ customType: "reqall-context", content: context, display: true }, { triggerTurn: true });
 		},
 	});

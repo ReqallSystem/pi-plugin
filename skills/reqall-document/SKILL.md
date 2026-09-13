@@ -76,8 +76,8 @@ segment, including `src`/`work`; a rootless plain directory uses machine memory.
 
 1. **Project** — Resolve the project name and call `reqall_upsert_project`; keep `project_id`.
 2. **Evaluate significance** — Decide whether the action is worth long-term memory.
-3. **Classify** — Use the same defaults as `reqall-persist`: bug fix -> `issue/resolved`, completed task -> `todo/resolved`, decision -> `arch/resolved`, spec -> `spec/open`, test evidence -> `test/active` or `test/resolved`, follow-up -> `todo/open`.
+3. **Classify** — Use the same defaults as `reqall-persist`: bug fix -> `issue/resolved`, session outcome -> advertised `work/resolved` (legacy `todo/resolved`); durable note -> advertised `info`, decision -> `arch/resolved`, spec -> `spec/open`, test evidence -> `test/active` or `test/resolved`, follow-up -> `todo/open`.
 4. **Search for related records** — Call `reqall_search` with a concise description of the work.
 5. **Upsert** — Call `reqall_upsert_record`; update a known duplicate by `id` rather than creating one.
-6. **Link** — Call `reqall_upsert_link` for clear relationships.
+6. **Link and verify** — Call `reqall_capabilities` before work/info or inline links. Use advertised inline links (max 20), otherwise `reqall_upsert_link`. Outcomes implement agreed intent; tests test it; open gap todos block it. Inspect every link result, repair partial failures using existing IDs, then read the record and all relevant link pages. Attribution is injected automatically; never invent a session label.
 7. **Summarize** — Output one line describing what was documented, or "Nothing to document."

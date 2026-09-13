@@ -17,7 +17,9 @@ async function fixture(run, { inMemory = false } = {}) {
     Object.assign(process.env, { REQALL_API_KEY: 'fixture-only', REQALL_URL: 'http://fixture.invalid', REQALL_AUTO_PERSIST: 'followup' });
     globalThis.fetch = async (url, options) => {
       assert.equal(url, 'http://fixture.invalid/mcp');
-      const rpc = JSON.parse(options.body); calls.push(rpc.params);
+      const rpc = JSON.parse(options.body);
+      if (rpc.method === 'tools/list') return new Response(JSON.stringify({ jsonrpc: '2.0', id: rpc.id, result: { tools: [] } }));
+      calls.push(rpc.params);
       return new Response(JSON.stringify({ jsonrpc: '2.0', id: rpc.id, result: { content: [{ type: 'text', text: rpc.params.name === 'upsert_project' ? 'Project #42' : '[]' }] } }));
     };
     const manager = inMemory ? SessionManager.inMemory(cwd) : SessionManager.create(cwd, join(cwd, 'sessions'));
@@ -138,7 +140,7 @@ test('actual loader: skill operation targets never replace the session selection
   await host.emit('session_start', { reason: 'startup' });
   await host.input('project_name=acme/original');
   await host.start('work');
-  for (const skill of ['sleep', 'context', 'persist', 'document', 'review', 'triage']) {
+  for (const skill of ['sleep', 'context', 'intend', 'persist', 'document', 'review', 'triage']) {
     const input = `/skill:reqall-${skill} project_name=.user`;
     await host.input(input);
     const baseDir = join(source, 'skills', `reqall-${skill}`);

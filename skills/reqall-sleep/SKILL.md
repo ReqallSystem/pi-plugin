@@ -9,7 +9,12 @@ description: Compress project memory — consolidate, split, compact, skip, and 
 User invoked sleep → rewrite and delete are expected. Compression is the point.
 Knowledge = decisions, outcomes, constraints, IDs, contracts — not session prose.
 
-Ops (fixed names): `consolidate` · `split` · `compact` · `skip` · `crosslink`
+Operations depend on server support. Inspect `reqall_capabilities` and returned
+candidates; legacy operations are `consolidate`, `split`, `compact`, `skip`,
+`crosslink`. Modern servers also offer work-log `promote`/`discard` and project
+merge candidates. Never invent operation shapes or assume a legacy server
+supports modern operations. Project merges are irreversible: obtain explicit
+confirmation for the exact source/target projects before applying them.
 
 Rate-limited server-side (~once per 24h per project). **Modest progress is success** — do not boil the ocean.
 
@@ -24,6 +29,8 @@ Rate-limited server-side (~once per 24h per project). **Modest progress is succe
 | Active/open; single topic, already clear | leave (no op) |
 | Cross-project pair; same concept, discovery-useful | **crosslink** |
 | Cross-project pair; superficial token overlap | omit |
+| Work log with durable knowledge | **promote** into durable records, then server deletes the log |
+| Work log with no durable knowledge | **discard** when supported |
 | Candidate unclear / not obvious | **omit this pass** (not a full-run refuse) |
 
 Prefer clear, concise records and useful links over perfect coverage. A long but appropriate record can wait for a later sleep.
@@ -99,8 +106,8 @@ segment, including `src`/`work`; a rootless plain directory uses machine memory.
    - **compact** — same id; leaner form.
    - **split** — focused sub-records; kind/status fit each topic.
    - **crosslink** — only when useful for discovery.
-5. `reqall_sleep_apply` once with the batch. No per-op confirmation.
-6. Report consolidated / compacted / split / crosslinked / skipped / errors. Note caps if truncated.
+5. `reqall_sleep_apply` once with the inspected batch. Ordinary compression needs no per-op confirmation; project merges require explicit confirmation. Session attribution is injected automatically for advertised schemas and follows server-side fan-out.
+6. Inspect all operation results and read back affected records/links as appropriate. Report consolidated / compacted / split / crosslinked / skipped / promoted / discarded / errors. Note caps and partial failures; do not report a whole batch successful from HTTP success alone.
 
 ## Rules
 
@@ -108,4 +115,4 @@ segment, including `src`/`work`; a rootless plain directory uses machine memory.
 - **consolidate always deletes sources** (server). Do not keep originals.
 - Do not ask whether rewrite/delete is OK — user ran sleep.
 - Unclear candidate → omit; do not invent merges or splits.
-- Safety is enforced by `reqall_sleep_apply` — do not re-check ownership/dependents.
+- Server authorization remains authoritative. `sleep_candidates` may refresh density/link-diff audits; it is not strictly read-only. Session labels are correlation metadata, not permission.

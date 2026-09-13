@@ -51,6 +51,7 @@
     "scripts",
     "skills",
     "README.md",
+    "PARITY.md",
     "LICENSE"
   ],
   "engines": {

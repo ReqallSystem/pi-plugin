@@ -13,7 +13,8 @@ Run this before the final user-facing response for non-trivial work. Create one 
 |---|---|---|
 | Bug fixed | issue | resolved |
 | New unfixed bug | issue | open |
-| Completed implementation/task | todo | resolved |
+| Session outcome/implementation | work if advertised, otherwise todo | resolved |
+| Durable reference note | info if advertised, otherwise suitable legacy kind | active |
 | Follow-up task | todo | open |
 | Architecture decision/change | arch | resolved |
 | New or updated specification | spec | open |
@@ -92,10 +93,14 @@ segment, including `src`/`work`; a rootless plain directory uses machine memory.
 3. **Analyze the session** — Enumerate files changed, commands/tests run, bugs fixed/discovered, decisions made, specs changed, and follow-ups.
 4. **Search/link context** — Use `reqall_search` to find related existing records. Use `reqall_get_record` if summaries are insufficient.
 5. **Upsert records** — For every meaningful item, call `reqall_upsert_record` with `project_id`, `kind`, `status`, `title`, and a detailed `body` including paths and outcomes.
-6. **Create links** — Use `reqall_upsert_link` for clear relationships: `implements`, `tests`, `blocks`, `parent`, or `related`.
-7. **Verify** — Call `reqall_list_records` with `project_id` to sanity-check the created/updated records.
+6. **Reconcile intent** — Outcomes `implements` agreed spec/arch, tests use `tests`, and open gap todos `blocks` unfulfilled intent. Call `reqall_capabilities` before using work/info or inline links. Prefer advertised inline `links` (max 20); otherwise use `reqall_upsert_link`. Inspect every created/existing/error link result. Missing results or errors are partial persistence: repair missing edges using the existing record ID, never recreate the record.
+7. **Verify** — Read each saved ID with `reqall_get_record`, checking project, body, kind and status. Enumerate outgoing `reqall_list_links` through all pages and verify endpoint IDs/tables and relationships; also verify any requested incoming edges. After repairs, repeat readbacks. Finish with project-scoped `reqall_list_records`. A transport success or summary list alone is not proof.
 8. **Report** — Tell the user what was persisted and any open follow-ups.
 
 ## Safety
+
+Attribution is automatic when the server advertises `session_id`; never supply an invented label. If Reqall is unavailable or a save remains partial, report that honestly. These verification steps are advisory; Pi does not enforce Codex's Stop contract.
+
+Successful routine git add/commit/push bookkeeping alone does not warrant another record; keep and reconcile any already-pending substantive work.
 
 Prefer status changes (`resolved`/`archived`) over deletion. Only call delete tools if the user explicitly requested deletion.
