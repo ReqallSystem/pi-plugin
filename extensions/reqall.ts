@@ -1,6 +1,5 @@
-import { execFileSync } from "node:child_process";
-import { basename } from "node:path";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
+import { extractProjectHint, resolveProjectBinding } from "./project-policy.js";
+import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { StringEnum } from "@mariozechner/pi-ai";
 import { Type } from "typebox";
 
@@ -64,25 +63,6 @@ function getConfig(): ReqallConfig {
 				? "followup"
 				: "reminder",
 	};
-}
-
-function detectProject(cwd: string): string {
-	if (process.env.REQALL_PROJECT_NAME) return process.env.REQALL_PROJECT_NAME;
-
-	try {
-		const remote = execFileSync("git", ["remote", "get-url", "origin"], {
-			cwd,
-			encoding: "utf8",
-			stdio: ["ignore", "pipe", "ignore"],
-			timeout: 2000,
-		}).trim();
-		const match = remote.match(/[:/]([^/]+\/[^/]+?)(?:\.git)?$/);
-		if (match?.[1]) return match[1];
-	} catch {
-		// Not a git repository, no remote, or git unavailable.
-	}
-
-	return basename(cwd);
 }
 
 function contentToText(result: McpToolResult | undefined): string {
@@ -233,9 +213,8 @@ async function resolveProjectId(projectName: string, signal?: AbortSignal): Prom
 	}
 }
 
-async function gatherProjectContext(query: string, cwd: string, signal?: AbortSignal, projectNameOverride?: string): Promise<string> {
+async function gatherProjectContext(query: string, projectName: string, signal?: AbortSignal): Promise<string> {
 	const config = getConfig();
-	const projectName = projectNameOverride || detectProject(cwd);
 	const sections: string[] = [`[reqall] Project: ${projectName}`];
 
 	const { projectId, projectText } = await resolveProjectId(projectName, signal);
@@ -324,6 +303,7 @@ function registerMcpTool(
 	parameters: ReturnType<typeof Type.Object>,
 	promptSnippet?: string,
 	promptGuidelines?: string[],
+	defaultProject?: (cwd: string) => string,
 ) {
 	pi.registerTool({
 		name,
@@ -332,14 +312,32 @@ function registerMcpTool(
 		promptSnippet,
 		promptGuidelines,
 		parameters,
-		async execute(_toolCallId, params, signal) {
-			return executeReqallTool(mcpTool, params as Record<string, unknown>, signal);
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const args = { ...params } as Record<string, unknown>;
+			if (defaultProject && !args.project_name) args.project_name = defaultProject(ctx.cwd);
+			return executeReqallTool(mcpTool, args, signal);
 		},
 	});
 }
 
 export default function reqallPiPlugin(pi: ExtensionAPI) {
 	let persistFollowupInProgress = false;
+	let selectedProject = "";
+	let pendingProject = "";
+	let activeProject = "";
+	const resolveProject = (cwd: string) => resolveProjectBinding(cwd, process.env, "", selectedProject).name;
+	const effectiveProject = (cwd: string) => activeProject || resolveProject(cwd);
+
+	// InputEvent.source distinguishes user input from extension-generated followups.
+	pi.on("input", async (event) => {
+		// Skill arguments describe one operation, not a session project switch.
+		const skillOperation = /^\/skill:reqall-(?:context|persist|document|review|triage|sleep)(?:\s|$)/.test(event.text);
+		if (event.source !== "extension" && !skillOperation) {
+			const hint = extractProjectHint(event.text);
+			if (hint) pendingProject = hint;
+		}
+		return { action: "continue" };
+	});
 
 	registerMcpTool(
 		pi,
@@ -355,6 +353,7 @@ export default function reqallPiPlugin(pi: ExtensionAPI) {
 		}),
 		"Search persistent Reqall memory for relevant records",
 		["Use reqall_search before changing tracked behavior or files to surface related specs, issues, and architecture decisions."],
+		effectiveProject,
 	);
 
 	registerMcpTool(
@@ -365,7 +364,7 @@ export default function reqallPiPlugin(pi: ExtensionAPI) {
 		"Create, retrieve, or rename a Reqall project. Safe to call repeatedly. Returns a project id required by reqall_upsert_record and reqall_list_records.",
 		Type.Object({
 			id: Type.Optional(Type.Integer({ description: "Project ID to rename/update." })),
-			name: Type.String({ description: "Project name, preferably org/repo from git remote or REQALL_PROJECT_NAME." }),
+			name: Type.String({ description: "Exact effective project name supplied by Reqall context, or a deliberate operation-specific target." }),
 		}),
 		"Create or retrieve the current Reqall project",
 	);
@@ -526,12 +525,33 @@ export default function reqallPiPlugin(pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const input = params as { query: string; project_name?: string };
-			const text = await gatherProjectContext(input.query, ctx.cwd, signal, input.project_name);
+			const text = await gatherProjectContext(input.query, input.project_name?.trim() || effectiveProject(ctx.cwd), signal);
 			return { content: [{ type: "text", text }], details: { reqallTool: "project_context" } };
 		},
 	});
 
-	pi.on("session_start", async (_event, ctx) => {
+	const restoreProjectSelection = (ctx: ExtensionContext, isNew = false) => {
+		selectedProject = "";
+		if (!isNew) {
+			// Custom entries stay out of model context and follow the active branch.
+			for (const entry of ctx.sessionManager.getBranch()) {
+				if (entry.type !== "custom" || entry.customType !== "reqall-project-selection") continue;
+				const data = entry.data as { projectName?: unknown } | undefined;
+				if (typeof data?.projectName === "string" && data.projectName.trim()) selectedProject = data.projectName.trim();
+			}
+		}
+		pendingProject = "";
+		activeProject = "";
+		persistFollowupInProgress = false;
+	};
+
+	// Pi emits session_tree only after navigation succeeds, in the same instance.
+	pi.on("session_tree", async (_event, ctx) => {
+		restoreProjectSelection(ctx);
+	});
+
+	pi.on("session_start", async (event, ctx) => {
+		restoreProjectSelection(ctx, event.reason === "new");
 		if (!ctx.hasUI) return;
 		const config = getConfig();
 		const theme = ctx.ui.theme;
@@ -540,7 +560,19 @@ export default function reqallPiPlugin(pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		const config = getConfig();
-		const projectName = detectProject(ctx.cwd);
+		// Pi emits input before queuing streaming followups. Bind only at a new
+		// context boundary, never mid-run or for generated persistence followups.
+		if (!event.prompt.startsWith("[reqall]")) {
+			if (pendingProject && pendingProject !== selectedProject) {
+				selectedProject = pendingProject;
+				pi.appendEntry("reqall-project-selection", { projectName: selectedProject });
+			}
+			pendingProject = "";
+			activeProject = resolveProject(ctx.cwd);
+		} else if (!activeProject) {
+			activeProject = resolveProject(ctx.cwd);
+		}
+		const projectName = effectiveProject(ctx.cwd);
 		const systemPrompt = `${event.systemPrompt}\n${reqallSystemPrompt(projectName)}`;
 
 		if (config.autoContext === "off" || event.prompt.startsWith("[reqall]")) {
@@ -562,7 +594,7 @@ export default function reqallPiPlugin(pi: ExtensionAPI) {
 
 		try {
 			if (ctx.hasUI) ctx.ui.setStatus("reqall", ctx.ui.theme.fg("accent", "reqall: context"));
-			const context = await gatherProjectContext(event.prompt, ctx.cwd, ctx.signal, projectName);
+			const context = await gatherProjectContext(event.prompt, projectName, ctx.signal);
 			if (ctx.hasUI) ctx.ui.setStatus("reqall", ctx.ui.theme.fg("success", "reqall"));
 			return {
 				systemPrompt,
@@ -596,7 +628,7 @@ export default function reqallPiPlugin(pi: ExtensionAPI) {
 		}
 		if (!looksNonTrivial(event.messages)) return;
 
-		const projectName = detectProject(ctx.cwd);
+		const projectName = effectiveProject(ctx.cwd);
 		if (config.autoPersist === "followup") {
 			persistFollowupInProgress = true;
 			pi.sendUserMessage(buildPersistPrompt(projectName), { deliverAs: "followUp" });
@@ -612,7 +644,7 @@ export default function reqallPiPlugin(pi: ExtensionAPI) {
 		description: "Fetch Reqall context for this project and query",
 		handler: async (args, ctx) => {
 			const query = args.trim() || (ctx.hasUI ? ctx.ui.getEditorText() : "") || "current project context";
-			const context = await gatherProjectContext(query, ctx.cwd, ctx.signal);
+			const context = await gatherProjectContext(query, effectiveProject(ctx.cwd), ctx.signal);
 			pi.sendMessage({ customType: "reqall-context", content: context, display: true }, { triggerTurn: true });
 		},
 	});
@@ -620,14 +652,14 @@ export default function reqallPiPlugin(pi: ExtensionAPI) {
 	pi.registerCommand("reqall-persist", {
 		description: "Ask the agent to classify and persist completed work to Reqall",
 		handler: async (args, ctx) => {
-			pi.sendUserMessage(buildPersistPrompt(detectProject(ctx.cwd), args.trim() || undefined));
+			pi.sendUserMessage(buildPersistPrompt(effectiveProject(ctx.cwd), args.trim() || undefined));
 		},
 	});
 
 	pi.registerCommand("reqall-review", {
 		description: "Review and triage open Reqall records for this project",
 		handler: async (args, ctx) => {
-			const projectName = detectProject(ctx.cwd);
+			const projectName = effectiveProject(ctx.cwd);
 			pi.sendUserMessage(`[reqall] Review open records for project_name="${projectName}". Use reqall_upsert_project, reqall_list_records${args.trim() ? ` with filter/instructions: ${args.trim()}` : ""}, reqall_get_record, reqall_upsert_record, and reqall_upsert_link as needed. Do not delete records unless explicitly requested.`);
 		},
 	});
@@ -635,7 +667,7 @@ export default function reqallPiPlugin(pi: ExtensionAPI) {
 	pi.registerCommand("reqall-triage", {
 		description: "Triage a new issue/request into Reqall",
 		handler: async (args, ctx) => {
-			const projectName = detectProject(ctx.cwd);
+			const projectName = effectiveProject(ctx.cwd);
 			pi.sendUserMessage(`[reqall] Triage this incoming issue/request for project_name="${projectName}". Description: ${args.trim() || "Ask the user for the issue/request details."}\n\nClassify it, gather missing structured details, search for duplicates, determine priority, create/update a Reqall record, and link related records.`);
 		},
 	});
@@ -643,8 +675,11 @@ export default function reqallPiPlugin(pi: ExtensionAPI) {
 	pi.registerCommand("reqall-sleep", {
 		description: "Run Reqall SLEEP knowledge-graph maintenance workflow",
 		handler: async (args, ctx) => {
-			const projectName = detectProject(ctx.cwd);
-			pi.sendUserMessage(`[reqall] Run SLEEP maintenance for project_name="${projectName}". ${args.trim() ? `User argument: ${args.trim()}.` : "Resolve the project id first."}\n\nUse reqall_upsert_project or reqall_list_projects to get project_id, call reqall_sleep_candidates, reason through consolidation/compact/split/crosslink operations, then call reqall_sleep_apply with the safe operation batch. Summarize results.`);
+			const argument = args.trim();
+			const target = /^\d+$/.test(argument)
+				? `project_id=${argument}`
+				: `project_name=${JSON.stringify(argument || effectiveProject(ctx.cwd))}`;
+			pi.sendUserMessage(`[reqall] Run SLEEP maintenance for ${target}. This is an operation-specific target; do not change the session project.\n\nUse the supplied project_id, or reqall_upsert_project or reqall_list_projects to resolve the exact project_name to project_id. Call reqall_sleep_candidates, reason through consolidation/compact/split/crosslink operations, then call reqall_sleep_apply with the safe operation batch. Summarize results.`);
 		},
 	});
 }
