@@ -17,20 +17,38 @@ export function isOwnEvent(event: { actor?: unknown; session_id?: unknown }, ori
 	return !!origin && event.actor === "self" && typeof event.session_id === "string" && event.session_id === origin;
 }
 
+/** Cancel only this waiter, not the shared discovery or other invocations. */
+function waitForDiscovery<T>(value: Promise<T>, signal?: AbortSignal): Promise<T> {
+	if (!signal) return value;
+	signal.throwIfAborted();
+	return new Promise<T>((resolve, reject) => {
+		const cleanup = () => signal.removeEventListener("abort", onAbort);
+		const onAbort = () => { cleanup(); reject(signal.reason); };
+		signal.addEventListener("abort", onAbort, { once: true });
+		value.then(
+			result => { cleanup(); resolve(result); },
+			error => { cleanup(); reject(error); },
+		);
+	});
+}
+
 export class Capabilities {
 	private cached?: { identity: string; expires: number; value: Promise<Map<string, ToolSchema>> };
 	constructor(private request: RpcRequest) {}
 
 	async discover(identity: string, signal?: AbortSignal): Promise<Map<string, ToolSchema>> {
-		if (this.cached?.identity === identity && this.cached.expires > Date.now()) return this.cached.value;
-		const value = this.load(signal);
+		signal?.throwIfAborted();
+		if (this.cached?.identity === identity && this.cached.expires > Date.now()) {
+			return waitForDiscovery(this.cached.value, signal);
+		}
+		// Discovery owns its deadline; no invocation may cancel the shared request.
+		const value = this.load(AbortSignal.timeout(15_000));
 		const entry = { identity, expires: Date.now() + 60_000, value };
 		this.cached = entry;
-		try { return await value; }
-		catch (error) {
+		void value.catch(() => {
 			if (this.cached === entry) this.cached = undefined;
-			throw error;
-		}
+		});
+		return waitForDiscovery(value, signal);
 	}
 
 	private async load(signal?: AbortSignal): Promise<Map<string, ToolSchema>> {

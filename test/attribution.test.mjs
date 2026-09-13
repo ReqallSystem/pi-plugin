@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync } from 'node:fs';
+import { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync, existsSync } from 'node:fs';
 import { resolve, join, dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { execFileSync } from 'node:child_process';
 import { SessionManager } from '@mariozechner/pi-coding-agent';
 import ts from 'typescript';
 const { loadExtensions } = await import(new URL('./core/extensions/loader.js', import.meta.resolve('@mariozechner/pi-coding-agent')));
@@ -17,7 +18,7 @@ const schema = name => ({ name, inputSchema: { properties: { ...(writes.includes
 async function fixture(run, { legacy = false, failDiscovery = false } = {}) {
   const env = { ...process.env }, fetch = globalThis.fetch;
   const cwd = mkdtempSync(resolve('.attribution-host-'));
-  const calls = [];
+  const calls = [], hosts = [];
   let denied = false, jsonOnly = false, partial = false, large = false;
   try {
     for (const key of Object.keys(process.env)) if (key.startsWith('REQALL_')) delete process.env[key];
@@ -45,14 +46,17 @@ async function fixture(run, { legacy = false, failDiscovery = false } = {}) {
       loaded.runtime.sendMessage = () => {};
       const extension = loaded.extensions[0];
       const ctx = { cwd, hasUI: false, sessionManager: manager };
-      return { manager, ctx,
+      const host = { manager, ctx,
         tool: (name, args = {}, signal) => extension.tools.get(`reqall_${name}`).definition.execute('fixture', args, signal, undefined, ctx),
         emit: async (name, event = {}) => { for (const fn of extension.handlers.get(name) || []) await fn({ type: name, ...event }, ctx); },
         command: name => extension.commands.get(name).handler('fixture query', ctx),
       };
+      hosts.push(host);
+      return host;
     }
     await run({ load, calls, cwd, setDenied: v => { denied = v; }, setJson: v => { jsonOnly = v; }, setPartial: v => { partial = v; }, setLarge: v => { large = v; } });
   } finally {
+    for (const host of hosts) await host.emit('session_shutdown', { reason: 'quit' });
     globalThis.fetch = fetch;
     for (const key of Object.keys(process.env)) if (!(key in env)) delete process.env[key];
     Object.assign(process.env, env);
@@ -183,6 +187,82 @@ test('capabilities paginate, isolate credentials/endpoints, recover from failure
   const loop = new Capabilities(async () => ({ tools: [], nextCursor: 'loop' }));
   await assert.rejects(loop.discover('a'), /cursor/);
 });
+
+test('cancelling either concurrent discovery waiter preserves the other write attribution', async () => {
+  for (const cancelledIndex of [0, 1]) {
+    let release, transportSignal, requests = 0;
+    const cap = new Capabilities(async (_method, _params, signal) => {
+      requests++;
+      transportSignal = signal;
+      return new Promise((resolve, reject) => {
+        const onAbort = () => reject(signal.reason);
+        signal.addEventListener('abort', onAbort, { once: true });
+        release = () => {
+          signal.removeEventListener('abort', onAbort);
+          resolve({ tools: [schema('upsert_record')] });
+        };
+      });
+    });
+    const controllers = [new AbortController(), new AbortController()];
+    const pending = controllers.map((controller, i) => cap.arguments('same/account', 'upsert_record', { id: 7 }, `pi:session-${i}`, controller.signal));
+    const rejected = assert.rejects(pending[cancelledIndex], /cancelled caller/);
+    controllers[cancelledIndex].abort(new Error('cancelled caller'));
+    await rejected; // Cancellation must settle before discovery completes.
+    assert.equal(transportSignal.aborted, false);
+    assert.equal(requests, 1);
+    release();
+    assert.equal((await pending[1 - cancelledIndex]).session_id, `pi:session-${1 - cancelledIndex}`);
+    await cap.discover('same/account');
+    assert.equal(requests, 1, 'one cancelled waiter must not evict successful discovery');
+    await assert.rejects(cap.discover('same/account', controllers[cancelledIndex].signal), /cancelled caller/);
+  }
+});
+
+test('large-result files survive readback, are instance-isolated and cleaned on every shutdown reason', async () => fixture(async ({ load, setLarge }) => {
+  const baselineListeners = process.listenerCount('exit');
+  const a = await load(), b = await load();
+  assert.equal(process.listenerCount('exit'), baselineListeners, 'loading alone registers no process resources');
+  setLarge(true);
+  const outputPath = result => result.content[0].text.match(/full result: (.+)\. Read it/)[1];
+  const otherPath = outputPath(await b.tool('get_record', { id: 8 }));
+  for (const reason of ['reload', 'new', 'resume', 'fork', 'quit']) {
+    const paths = [];
+    for (let i = 0; i < 2; i++) paths.push(outputPath(await a.tool('get_record', { id: 7 })));
+    assert.equal(process.listenerCount('exit'), baselineListeners + 2, 'one exit listener per owning instance');
+    for (const path of paths) assert.ok(readFileSync(path, 'utf8').includes('x'.repeat(20_000)));
+    await a.emit('session_shutdown', { reason });
+    await a.emit('session_shutdown', { reason }); // Idempotent.
+    for (const path of paths) assert.equal(existsSync(dirname(path)), false);
+    assert.equal(process.listenerCount('exit'), baselineListeners + 1);
+    assert.equal(existsSync(otherPath), true, 'other sessions still need their readback');
+  }
+  await b.emit('session_shutdown', { reason: 'quit' });
+  assert.equal(existsSync(dirname(otherPath)), false);
+  assert.equal(process.listenerCount('exit'), baselineListeners);
+
+  // Normal process exit must also clean files if no host shutdown event fired.
+  const loaderUrl = new URL('./core/extensions/loader.js', import.meta.resolve('@mariozechner/pi-coding-agent')).href;
+  const childPath = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', `
+    import assert from 'node:assert/strict';
+    const { loadExtensions } = await import(${JSON.stringify(loaderUrl)});
+    globalThis.fetch = async (url, options) => {
+      assert.equal(url, 'http://fixture.invalid/mcp');
+      const rpc = JSON.parse(options.body);
+      return new Response(JSON.stringify({ jsonrpc: '2.0', id: rpc.id, result:
+        rpc.method === 'tools/list' ? { tools: [] } : { content: [{ type: 'text', text: 'x'.repeat(20000) }] }
+      }));
+    };
+    const loaded = await loadExtensions([${JSON.stringify(join(source, 'extensions/reqall.ts'))}], process.cwd());
+    assert.deepEqual(loaded.errors, []);
+    const result = await loaded.extensions[0].tools.get('reqall_get_record').definition.execute(
+      'fixture', { id: 7 }, undefined, undefined,
+      { cwd: process.cwd(), sessionManager: { getSessionId: () => 'fixture-exit' } }
+    );
+    const path = result.content[0].text.split('full result: ')[1].split('. Read it')[0];
+    console.log(JSON.stringify(path));
+  `], { encoding: 'utf8', timeout: 15_000 }));
+  assert.equal(existsSync(dirname(childPath)), false, 'process exit removes both file and directory');
+}));
 
 test('event suppression retains legacy, unknown, other-account and other-session same-record edits', () => {
   const own = originatingSession('host-session');

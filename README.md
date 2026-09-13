@@ -104,7 +104,9 @@ sessions have new UUIDs and therefore new labels. Async invocation-local storage
 keeps concurrent calls isolated.
 
 Paginated `tools/list` discovery is cached for 60 seconds per extension and
-endpoint/credential identity. Every exposed write (including project resolution,
+endpoint/credential identity. Discovery has its own 15-second deadline; cancelling
+one caller stops only that caller's wait, not another invocation's discovery or
+attribution. Every exposed write (including project resolution,
 inline links, deletion, SLEEP and project merge) receives `session_id` only when
 its own schema advertises the string field. Supplied labels are replaced, never
 trusted. Legacy/discovery-unavailable servers continue without attribution;
@@ -117,8 +119,11 @@ losing links or changing record kinds. Legacy outcomes use `todo` and separate
 `reqall_upsert_link` calls. Pass `tool_name: "sleep_apply"` for operation schemas.
 Tools preserve structured results, including per-link partial failures. Visible
 output is bounded to 12,000 characters; truncated results are saved in a private
-temporary directory (file mode 0600) with a path for full readback. Narrow queries
-or paginate when possible.
+temporary directory (file mode 0600) with a path for full readback. Each extension
+instance removes its files at session shutdown (including reload/session switches)
+or normal process exit; fetch again after resuming instead of relying on old
+paths. Cleanup is best-effort and cannot run after SIGKILL or a machine failure.
+Narrow queries or paginate when possible.
 
 The workflow is context → agreed intent → work → persist/reconcile → readback.
 `reqall-intend` reuses or creates one spec/arch for agreed non-trivial changes.

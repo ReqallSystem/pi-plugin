@@ -1,5 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Capabilities, originatingSession } from "./capabilities.js";
@@ -135,6 +135,22 @@ export default function reqallPiPlugin(pi: ExtensionAPI) {
 		originContext.run(originatingSession(ctx.sessionManager.getSessionId()), fn);
 	const capabilities = new Capabilities(request);
 	const capabilityIdentity = () => JSON.stringify([getConfig().url, getConfig().apiKey]);
+	const outputDirectories = new Set<string>();
+	let exitCleanupRegistered = false;
+	const cleanupOutputs = () => {
+		for (const directory of outputDirectories) {
+			try {
+				rmSync(directory, { recursive: true, force: true });
+				outputDirectories.delete(directory);
+			} catch { /* Best effort; retain ownership for a retry at process exit. */ }
+		}
+		if (outputDirectories.size === 0 && exitCleanupRegistered) {
+			process.off("exit", cleanupOutputs);
+			exitCleanupRegistered = false;
+		}
+	};
+	// Includes quit, reload and session replacement. Never remove another instance's files.
+	pi.on("session_shutdown", cleanupOutputs);
 
 async function callReqallMcp(toolName: string, args: Record<string, unknown>, signal?: AbortSignal): Promise<McpToolResult> {
 	const origin = originContext.getStore();
@@ -203,9 +219,15 @@ function structuredPayload(result: McpToolResult): Record<string, any> | undefin
 function boundedText(full: string): string {
 	let text = full;
 	if (full.length > 12_000) {
-		const path = join(mkdtempSync(join(tmpdir(), "reqall-output-")), "result.txt");
+		const directory = mkdtempSync(join(tmpdir(), "reqall-output-"));
+		outputDirectories.add(directory);
+		if (!exitCleanupRegistered) {
+			process.once("exit", cleanupOutputs);
+			exitCleanupRegistered = true;
+		}
+		const path = join(directory, "result.txt");
 		writeFileSync(path, full, { mode: 0o600 });
-		text = `${full.slice(0, 12_000)}\n[Reqall output truncated; full result: ${path}. Read it before verification.]`;
+		text = `${full.slice(0, 12_000)}\n[Reqall output truncated; full result: ${path}. Read it before verification. Removed at session shutdown/reload or process exit; fetch again after resuming.]`;
 	}
 	return text;
 }

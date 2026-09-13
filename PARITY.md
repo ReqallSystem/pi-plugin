@@ -60,8 +60,8 @@ unreleased changes; this is not a claim about marketplace deployments.
 
 ## Verification and boundaries
 
-- `npm test`: TypeScript, 12 routing/lifecycle/attribution tests on source and
-  again on the extracted npm package, plus package assertions (13 top-level
+- `npm test`: TypeScript, 14 routing/lifecycle/attribution tests on source and
+  again on the extracted npm package, plus package assertions (15 top-level
   tests). All network tests use an asserted fixture-only endpoint.
 - Real Pi SessionManager persistence is exercised for resume/reload and forks;
   compaction and new sessions preserve/renew origin as appropriate. Two sessions
@@ -69,6 +69,12 @@ unreleased changes; this is not a claim about marketplace deployments.
 - Tests cover all exposed writes, context/command upserts, inline links,
   capability pagination/cache isolation, legacy/discovery failures, denied writes,
   structured/JSON-text results, partial link visibility and cancellation.
+- Codex PR review regressions reproduce both original defects before the fix:
+  cancelling either concurrent discovery waiter no longer cancels the shared
+  discovery or strips the other write's attribution; temporary result files are
+  instance-isolated and removed on all shutdown reasons and real child-process
+  exit. Listeners are registered lazily and removed after cleanup. Reload/resume
+  requires fetching a fresh result rather than reusing a removed temporary path.
 - Installed pi 0.85.1: isolated offline RPC startup loaded all six commands with
   no extension errors and no Reqall/provider request. Existing 0.73-era dev
   dependencies remain; this smoke check is not a full multi-version SDK matrix.
