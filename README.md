@@ -152,9 +152,14 @@ context-injection mode the project is initialized first. Set
 hasn't reached a new context boundary do not poll.
 
 Each Pi session has an opaque `pi-auto:` subscriber distinct from its originating
-write label. New/fork sessions get independent cursors. Project switches release
-only the old project/cursor before rebinding; failed cleanup is retried. Reload
-preserves the cursor; other shutdown reasons attempt release. Quit/resume of a
+write label. New/fork sessions get independent cursors. If a project switch finds
+an unreceived write-ahead page, it replays that page with an explicit previous-project
+label and defers automatic subscription rebind until the receipt is saved. The
+new effective project for context, tools and persistence is not reverted. Once
+delivered, only the old project/cursor is released before rebinding; failed cleanup
+is retried. This preserves the fetched page, not unfetched old-project backlog;
+the new subscription starts at the server head when it is bound. Reload preserves
+the cursor; other shutdown reasons attempt release. Quit/resume of a
 successfully released subscription starts at the current server head, not an
 offline history replay. Interrupted or lost enrollments are recovered by listing
 only the owned automatic label during cleanup. Cleanup is best-effort: a lost

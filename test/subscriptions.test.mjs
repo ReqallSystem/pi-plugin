@@ -114,6 +114,45 @@ test('write-ahead page replays until persisted receipt; only then ack/paginate, 
   await a.manager.close(false); await resumed.manager.close();
 });
 
+test('project switches replay unreceived pages before release, including restored and legacy state', async () => {
+  for (const legacy of [false, true]) for (const restored of [false, true]) {
+    const s = server({ legacy }), original = runtime(s);
+    await original.manager.turn('alpha');
+    for (let i = 0; i < 6; i++) s.event();
+    const first = await original.manager.turn('alpha');
+    const saved = structuredClone(original.last());
+    const a = restored ? runtime(s, 'pi:one', saved) : original;
+    if (restored) await original.manager.close(false);
+    const before = s.calls.length;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const replay = await a.manager.turn('beta');
+      assert.equal(replay?.token, first.token, 'project changes must preserve the undelivered token');
+      assert.match(replay.text, /previous project #1/);
+      assert.match(replay.text, /current effective project is unchanged/);
+      assert.match(replay.text, /event #1\)/);
+      assert.match(replay.text, /Additional old-project events are not drained/);
+      assert.equal(s.calls.length, before, 'neither release nor a new enrollment is allowed before receipt');
+      assert.equal(s.subscriptions.has(s.key(1, a.manager.subscriber)), true);
+      assert.equal(s.subscriptions.has(s.key(2, a.manager.subscriber)), false);
+      assert.deepEqual(a.last() ?? saved, saved);
+    }
+    a.delivered.add(first.token);
+    s.failUnsubscribe(true);
+    await a.manager.turn('beta');
+    assert.equal(s.subscriptions.has(s.key(2, a.manager.subscriber)), false);
+    assert.deepEqual(a.last() ?? saved, saved, 'failed cleanup preserves the page for safe retry');
+    s.failUnsubscribe(false);
+    const rebindStart = s.calls.length;
+    assert.equal(await a.manager.turn('beta'), undefined);
+    assert.deepEqual(s.calls.slice(rebindStart).map(c => c.name), ['unsubscribe_project', 'subscribe_project', 'poll_subscriptions']);
+    assert.equal(s.subscriptions.has(s.key(1, a.manager.subscriber)), false);
+    assert.equal(s.subscriptions.has(s.key(2, a.manager.subscriber)), true);
+    assert.equal(a.last().projectName, 'beta');
+    assert.equal(a.last().pending, undefined);
+    await a.manager.close();
+  }
+});
+
 test('lost modern poll responses retry without loss; legacy mode never sends ack fields', async () => {
   for (const legacy of [false, true]) {
     const s = server({ legacy }), a = runtime(s);
@@ -294,6 +333,48 @@ test('Pi loader persists delivery receipts across reload/compaction/tree and iso
   await fork.start();
   assert.equal(s.subscriptions.size, 2);
   assert.notEqual(s.calls.at(-1).args.subscriber, subscriptionLabel(origin, 'auto'));
+}));
+
+test('Pi reload plus project switch replays the old page without reverting effective binding, then rebinds after persisted receipt', async () => hostFixture(async ({ s, load, cwd }) => {
+  let host = await load(SessionManager.create(cwd, join(cwd, 'sessions')));
+  host.manager.appendMessage({ role: 'assistant', content: [], timestamp: 0 });
+  await host.emit('session_start', { reason: 'startup' });
+  await host.start(); s.event();
+  const pending = await host.start();
+  const token = pending.message.details.subscriptionBatch;
+  const subscriber = s.calls.at(-1).args.subscriber;
+  const reopen = async () => {
+    await host.emit('session_shutdown', { reason: 'reload' });
+    host = await load(SessionManager.open(host.manager.getSessionFile(), host.manager.getSessionDir()));
+    await host.emit('session_start', { reason: 'reload' });
+  };
+  await reopen(); // Notification has not been persisted, only the write-ahead state.
+  process.env.REQALL_PROJECT_NAME = 'beta';
+  const before = s.calls.length;
+  const replay = await host.start('work in beta');
+  assert.equal(replay.message?.details.subscriptionBatch, token);
+  assert.match(replay.message.content, /previous project #1/);
+  assert.match(replay.message.content, /event #1\)/);
+  assert.match(replay.systemPrompt, /Current project name: `beta`/);
+  assert.equal(replay.message.details.projectName, 'beta', 'old hints cannot change the effective binding');
+  assert.equal(s.calls.length, before);
+  assert.equal(s.subscriptions.has(s.key(1, subscriber)), true);
+  assert.equal(s.subscriptions.has(s.key(2, subscriber)), false);
+  await reopen(); // A second interrupted replay must still retain the same page.
+  const again = await host.start();
+  assert.equal(again.message.details.subscriptionBatch, token);
+  host.receipt(again);
+  await reopen(); // Receipt recovery must also work from disk, not just memory.
+  const next = await host.start();
+  assert.equal(next.message, undefined);
+  assert.match(next.systemPrompt, /Current project name: `beta`/);
+  assert.deepEqual(s.calls.slice(before).map(c => c.name), ['unsubscribe_project', 'subscribe_project', 'poll_subscriptions']);
+  assert.equal(s.subscriptions.has(s.key(1, subscriber)), false);
+  assert.equal(s.subscriptions.has(s.key(2, subscriber)), true);
+  s.event({ project_id: 2 });
+  const betaPage = await host.start();
+  assert.match(betaPage.message.content, /Project #2: record.updated/);
+  assert.doesNotMatch(betaPage.message.content, /previous project|Project #1:/);
 }));
 
 test('Pi automatic polling skips generated turns and disabled/missing-key sessions; rebind follows only effective project', async () => hostFixture(async ({ s, load }) => {

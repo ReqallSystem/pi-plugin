@@ -78,6 +78,11 @@ unreleased changes; this is not a claim about marketplace deployments.
   fallback, lost responses/enrollments, scope/shape validation, opt-out/throttling,
   credential-boundary isolation, failed cleanup and cancellation. No production
   subscriptions were created during development.
+- PR #2's rebind regression reproduces pending-page loss before the fix. Tests
+  cover live/restored and modern/legacy pages, repeated replay, cleanup failure,
+  and the actual Pi loader with repeated disk reloads before/after receipt. The
+  old page is labelled explicitly while the new effective binding stays intact;
+  rebind proceeds only after the matching receipt is persisted.
 - Installed pi 0.85.1: isolated offline RPC startup loaded all six commands with
   no extension errors and no Reqall/provider request. Existing 0.73-era dev
   dependencies remain; this smoke check is not a full multi-version SDK matrix.
