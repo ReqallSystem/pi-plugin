@@ -79,7 +79,7 @@ export class Capabilities {
 		if (name === "merge_projects" && !tools?.has(name)) throw new Error("Reqall merge_projects is not advertised by this server");
 		const properties = tools?.get(name)?.inputSchema?.properties;
 		// Additive features must be positively discovered, never silently discarded or downgraded.
-		for (const field of ["links", "project_only"]) {
+		for (const field of ["links", "project_only", "ack", "ack_cursor"]) {
 			if (args[field] !== undefined && !properties?.[field]) throw new Error(`Reqall ${name}.${field} is not advertised; use legacy tools or retry reqall_capabilities.`);
 		}
 		if ((args.kind === "work" || args.kind === "info") && !properties?.kind?.enum?.includes(args.kind)) {
