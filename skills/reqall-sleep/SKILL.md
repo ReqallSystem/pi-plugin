@@ -29,11 +29,40 @@ Rate-limited server-side (~once per 24h per project). **Modest progress is succe
 | Active/open; single topic, already clear | leave (no op) |
 | Cross-project pair; same concept, discovery-useful | **crosslink** |
 | Cross-project pair; superficial token overlap | omit |
-| Work log with durable knowledge | **promote** into durable records, then server deletes the log |
-| Work log with no durable knowledge | **discard** when supported |
+| `work_review`: unique durable information after comparison | **promote** into durable records, then server deletes the log |
+| `work_review`: no unique durable information after comparison | **discard** when supported, after preserving useful relationships |
 | Candidate unclear / not obvious | **omit this pass** (not a full-run refuse) |
 
 Prefer clear, concise records and useful links over perfect coverage. A long but appropriate record can wait for a later sleep.
+
+## WORK review policy
+
+Use host equivalents of the tool names below, and only advertised operations/kinds.
+If the required reads or operations are unavailable, omit the candidate this pass.
+
+1. Read each WORK log with `get_record`, paginate incoming/outgoing `list_links`,
+   and read linked ARCH/SPEC and other durable records. Use project-scoped `search`
+   to find existing intent and knowledge, especially when links are missing.
+2. **Alignment is not redundancy.** Preserve unique implementation constraints,
+   regression fixes, test evidence, outcomes, and remaining limitations even when
+   the work followed its spec. Use `promote` into appropriate durable kinds.
+3. **Discard only after comparison shows no unique durable information.** Identify
+   the surviving records that cover useful content; a knowledge-free log needs none.
+   Preserve useful relationships on durable records before discarding: `discard`
+   deletes the log's links too. If coverage or relationship meaning is unclear, omit.
+4. Preserve an evidence-backed unresolved deviation as a linked `issue`, separating
+   expected behavior, observed behavior, and uncertainty about the cause. The
+   implementation or the spec may be wrong. Do not automatically rewrite ARCH/SPEC.
+5. **Missing links do not prove new requirements.** Reuse intent found by search.
+   Promote a novel fact to `info` (or another fitting durable kind); use `spec` only
+   for confirmed requirements, never to turn an unapproved proposal into a decision.
+6. **Leave ambiguous cases unchanged.** Preserve historical qualifications: dated
+   test results and past PR state are not current deployment/runtime guarantees.
+7. Before apply, snapshot source records/links and re-read touched records for drift.
+   After apply, inspect every result, read back outputs and surviving links, and
+   verify deleted sources return structured not-found. Link a new issue to its
+   relevant intent with `upsert_link` if needed, then verify. Repair only confirmed
+   missing edges. Never replay a destructive batch after an ambiguous response.
 
 ## Project binding (portable policy)
 
@@ -100,8 +129,8 @@ segment, including `src`/`work`; a rootless plain directory uses machine memory.
 
 1. Resolve the operation target — explicit user project ID/name first, otherwise the supplied effective binding or portable policy below. Never change the retained session selection for SLEEP.
 2. `reqall_upsert_project` (or `reqall_list_projects`) → `project_id`.
-3. `reqall_sleep_candidates` with `project_id`. Rate-limited → report next time and stop. Empty → graph healthy.
-4. Select ops from the decision table. Prefer obvious wins; small batch is fine. Bodies: terse, non-redundant.
+3. `reqall_sleep_candidates` with `project_id`. Rate-limited → report next time and stop. Empty → no eligible candidates this pass.
+4. Select ops from the decision table and WORK review policy above. Prefer obvious wins; small batch is fine. Bodies: terse, non-redundant.
    - **consolidate** — `kind: "arch"`, `status: "resolved"`; best title; knowledge from all members; wording disposable.
    - **compact** — same id; leaner form.
    - **split** — focused sub-records; kind/status fit each topic.
@@ -112,7 +141,7 @@ segment, including `src`/`work`; a rootless plain directory uses machine memory.
 ## Rules
 
 - Knowledge ≠ wording. Prose is disposable; durable facts are not.
-- **consolidate always deletes sources** (server). Do not keep originals.
+- **consolidate always deletes sources** (server). **promote** and **discard** delete WORK logs only; never output `work` from SLEEP.
 - Do not ask whether rewrite/delete is OK — user ran sleep.
 - Unclear candidate → omit; do not invent merges or splits.
 - Server authorization remains authoritative. `sleep_candidates` may refresh density/link-diff audits; it is not strictly read-only. Session labels are correlation metadata, not permission.
