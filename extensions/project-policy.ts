@@ -176,5 +176,7 @@ export function normalizeRemote(remote: string): string {
   }
   const parts = path.replace(/^\/+|\/+$/g, '').replace(/\.git$/, '').split('/');
   if (parts.length < 2 || parts.some(p => !p || p === '.' || p === '..')) return '';
-  return parts.slice(-2).join('/');
+  // The final candidate must satisfy the automatic-name grammar: escapes, Unicode,
+  // spaces, and other unsupported characters fall through to portable metadata.
+  return safeName(parts.slice(-2).join('/'));
 }
